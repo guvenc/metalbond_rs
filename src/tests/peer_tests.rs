@@ -27,7 +27,7 @@ async fn test_peer_creation() {
 
     // Create peer
     let remote_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 4711);
-    let (peer, mut wire_rx) = Peer::new(mb_tx, config, remote_addr, ConnectionDirection::Outgoing, false);
+    let (peer, mut wire_rx) = Peer::new(mb_tx, config, remote_addr, ConnectionDirection::Outgoing);
 
     // Verify peer properties
     assert_eq!(peer.get_remote_addr(), remote_addr);
@@ -47,47 +47,42 @@ async fn test_peer_creation() {
 }
 
 /**
- * Tests sending a Hello message from a peer.
- * Verifies that:
- * 1. The peer can successfully send a Hello message
- * 2. The message contains the correct is_server flag
- * 3. The message contains the correct keepalive_interval from the config
- * 4. The message is properly received on the wire channel
+ * Tests the peer's ability to send a hello message.
+ *
+ * Expected behavior:
+ * * 1. The peer sends the hello message
+ * * 2. The message contains the correct keepalive_interval from the config
+ * * 3. The message is sent immediately
  */
 #[tokio::test]
 async fn test_peer_send_hello() {
-    // Create channels
-    let (mb_tx, _mb_rx) = mpsc::channel(10);
-
-    // Create config
-    let config = Arc::new(Config::default());
-
     // Create peer
+    let config = Arc::new(Config::default());
+    let (mb_tx, _) = mpsc::channel(10);
     let remote_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 4711);
-    let (peer, mut wire_rx) = Peer::new(mb_tx, config, remote_addr, ConnectionDirection::Outgoing, false);
+    let (peer, mut wire_rx) = Peer::new(mb_tx, config.clone(), remote_addr, ConnectionDirection::Outgoing);
 
     // Send a hello message
-    let is_server = true;
-    let result = timeout(Duration::from_millis(500), peer.send_hello(is_server))
+    let result = timeout(Duration::from_millis(500), peer.send_hello())
         .await
-        .unwrap();
+        .expect("send_hello timed out");
+    // Check that no errors were returned
     assert!(result.is_ok());
 
-    // Check that message was sent to wire
-    if let Ok(Some(msg)) = timeout(Duration::from_millis(100), wire_rx.recv()).await {
+    // Check that the message was sent on the wire
+    if let Some(msg) = timeout(Duration::from_millis(100), wire_rx.recv()).await.unwrap() {
         match msg {
             GeneratedMessage::Hello(hello) => {
-                assert_eq!(hello.is_server, is_server);
-                assert_eq!(hello.keepalive_interval, 5); // Default from Config
+                // Check server flag was set based on direction (outgoing = client)
+                assert_eq!(hello.is_server, false);
+                // Check keepalive interval
+                assert_eq!(hello.keepalive_interval, config.keepalive_interval.as_secs() as u32);
             }
-            _ => panic!("Wrong message type received"),
+            _ => panic!("Expected Hello message"),
         }
     } else {
-        panic!("No message was sent to wire");
+        panic!("No message received from send_hello");
     }
-
-    // Clean up
-    peer.trigger_shutdown();
 }
 
 /**
@@ -107,7 +102,7 @@ async fn test_peer_send_keepalive() {
 
     // Create peer
     let remote_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 4711);
-    let (peer, mut wire_rx) = Peer::new(mb_tx, config, remote_addr, ConnectionDirection::Outgoing, false);
+    let (peer, mut wire_rx) = Peer::new(mb_tx, config, remote_addr, ConnectionDirection::Outgoing);
 
     // Send a keepalive message
     let result = timeout(Duration::from_millis(500), peer.send_keepalive())
@@ -148,7 +143,7 @@ async fn test_peer_send_subscribe() {
 
     // Create peer
     let remote_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 4711);
-    let (peer, mut wire_rx) = Peer::new(mb_tx, config, remote_addr, ConnectionDirection::Outgoing, false);
+    let (peer, mut wire_rx) = Peer::new(mb_tx, config, remote_addr, ConnectionDirection::Outgoing);
 
     // Send a subscribe message
     let vni: Vni = 100;
@@ -190,7 +185,7 @@ async fn test_peer_send_unsubscribe() {
 
     // Create peer
     let remote_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 4711);
-    let (peer, mut wire_rx) = Peer::new(mb_tx, config, remote_addr, ConnectionDirection::Outgoing, false);
+    let (peer, mut wire_rx) = Peer::new(mb_tx, config, remote_addr, ConnectionDirection::Outgoing);
 
     // Send an unsubscribe message
     let vni: Vni = 100;
@@ -233,7 +228,7 @@ async fn test_peer_send_update() {
 
     // Create peer
     let remote_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 4711);
-    let (peer, mut wire_rx) = Peer::new(mb_tx, config, remote_addr, ConnectionDirection::Outgoing, false);
+    let (peer, mut wire_rx) = Peer::new(mb_tx, config, remote_addr, ConnectionDirection::Outgoing);
 
     // Send an update message
     let action = UpdateAction::Add;
@@ -299,7 +294,7 @@ async fn test_peer_state_changes() {
 
     // Create peer
     let remote_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 4711);
-    let (peer, _wire_rx) = Peer::new(mb_tx, config, remote_addr, ConnectionDirection::Outgoing, false);
+    let (peer, _wire_rx) = Peer::new(mb_tx, config, remote_addr, ConnectionDirection::Outgoing);
 
     // Helper function to check state
     async fn check_state(peer: &Peer, expected_state: ConnectionState) {
@@ -350,8 +345,7 @@ async fn test_auto_subscription_on_established() {
         mb_tx, 
         config, 
         remote_addr, 
-        ConnectionDirection::Outgoing, 
-        false
+        ConnectionDirection::Outgoing
     );
 
     // Set up fake VNIs that will be returned when the peer asks for subscriptions
@@ -407,4 +401,35 @@ async fn test_auto_subscription_on_established() {
     assert_eq!(subscription_count, test_vnis.len(), 
                "Expected {} subscription messages, got {}", 
                test_vnis.len(), subscription_count);
+}
+
+/**
+ * Tests the basic creation of a peer.
+ *
+ * Expected behavior:
+ * * 1. Peer is created with the provided parameters
+ * * 2. Initial connection state is Connecting
+ * * 3. Remote address matches the provided address
+ */
+#[tokio::test]
+async fn test_peer_basic_creation() {
+    // Create channels
+    let (mb_tx, _mb_rx) = mpsc::channel(10);
+
+    // Create config
+    let config = Arc::new(Config::default());
+
+    // Create peer
+    let remote_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 4711);
+    let (peer, _wire_rx) = Peer::new(mb_tx, config, remote_addr, ConnectionDirection::Outgoing);
+
+    // Verify peer properties
+    assert_eq!(peer.get_remote_addr(), remote_addr);
+
+    // Check initial state
+    let state = timeout(Duration::from_millis(500), peer.get_state())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(state, ConnectionState::Connecting);
 }

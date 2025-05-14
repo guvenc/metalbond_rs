@@ -51,7 +51,7 @@ pub enum PeerError {
 // Messages that can be sent to the Peer actor
 #[derive(Debug)]
 pub enum PeerMessage {
-    SendHello(bool, oneshot::Sender<Result<()>>),
+    SendHello(oneshot::Sender<Result<()>>),
     SendKeepalive(oneshot::Sender<Result<()>>),
     SendSubscribe(Vni, oneshot::Sender<Result<()>>),
     SendUnsubscribe(Vni, oneshot::Sender<Result<()>>),
@@ -64,8 +64,7 @@ pub enum PeerMessage {
     ),
     GetState(oneshot::Sender<ConnectionState>),
     SetState(ConnectionState),
-    SetHelloReceived(bool),
-    GetHelloExchangeStatus(oneshot::Sender<(bool, bool)>), // (hello_sent, hello_received)
+    GetConnectionState(oneshot::Sender<ConnectionState>),
     Retry,
     Shutdown,
 }
@@ -167,15 +166,15 @@ struct PeerState {
     metalbond_tx: mpsc::Sender<MetalBondCommand>,
     config: Arc<Config>,
     remote_addr: SocketAddr,
+    #[allow(dead_code)]
     local_addr: Option<SocketAddr>,
     direction: ConnectionDirection,
+    #[allow(dead_code)]
     is_remote_server: bool,
     state: ConnectionState,
+    #[allow(dead_code)]
     subscribed_vnis_remote: HashSet<Vni>,
     wire_tx: mpsc::Sender<GeneratedMessage>,
-    hello_sent: bool,
-    hello_received: bool,
-    is_server: bool, // Store whether this peer is a server
 }
 
 /// Public interface for a peer connection.
@@ -197,13 +196,11 @@ impl Peer {
     /// * `config` - System configuration
     /// * `remote_addr` - Address of the remote peer
     /// * `direction` - Direction of the connection (incoming or outgoing)
-    /// * `is_server` - Whether this instance is acting as a server
     pub fn new(
         metalbond_tx: mpsc::Sender<MetalBondCommand>,
         config: Arc<Config>,
         remote_addr: SocketAddr,
         direction: ConnectionDirection,
-        is_server: bool,
     ) -> (Arc<Self>, mpsc::Receiver<GeneratedMessage>) {
         let (wire_tx, wire_rx) = mpsc::channel(PEER_TX_BUFFER_SIZE);
         let (message_tx, message_rx) = mpsc::channel(32);
@@ -219,9 +216,6 @@ impl Peer {
             state: ConnectionState::Connecting,
             subscribed_vnis_remote: HashSet::new(),
             wire_tx,
-            hello_sent: false,
-            hello_received: false,
-            is_server,
         };
 
         // Create a span for this peer actor
@@ -249,8 +243,8 @@ impl Peer {
             
             async {
                 match msg {
-                    PeerMessage::SendHello(is_server, resp) => {
-                        let result = Self::handle_send_hello(&mut state, is_server).await;
+                    PeerMessage::SendHello(resp) => {
+                        let result = Self::handle_send_hello(&mut state, false).await;
                         let _ = resp.send(result);
                     }
                     PeerMessage::SendKeepalive(resp) => {
@@ -298,14 +292,14 @@ impl Peer {
                                 info!("Connection lost, cleaning up peer resources");
                                 Self::handle_connection_lost(&state).await;
                             }
+                            (_, ConnectionState::Connecting) => {
+                                debug!("Transitioning to CONNECTING state");
+                            }
                             _ => {}
                         }
                     }
-                    PeerMessage::SetHelloReceived(received) => {
-                        state.hello_received = received;
-                    }
-                    PeerMessage::GetHelloExchangeStatus(resp) => {
-                        let _ = resp.send((state.hello_sent, state.hello_received));
+                    PeerMessage::GetConnectionState(resp) => {
+                        let _ = resp.send(state.state);
                     }
                     PeerMessage::Retry => {
                         // Handle retry logic
@@ -316,8 +310,7 @@ impl Peer {
                             // If this is an outgoing connection, attempt to reconnect
                             if state.direction == ConnectionDirection::Outgoing {
                                 // Reset hello flags
-                                state.hello_sent = false;
-                                state.hello_received = false;
+                                state.state = ConnectionState::Connecting;
                                 
                                 // Notify MetalBond about the retry attempt
                                 let (tx, rx) = oneshot::channel();
@@ -356,41 +349,32 @@ impl Peer {
     }
 
     // Helper methods for the actor
-    async fn handle_send_hello(state: &mut PeerState, is_server: bool) -> Result<()> {
+    async fn handle_send_hello(state: &mut PeerState, _is_server: bool) -> Result<()> {
+        // Derive is_server from connection direction
+        let is_server_derived = state.direction == ConnectionDirection::Incoming;
         let hello = pb::Hello {
             keepalive_interval: state.config.keepalive_interval.as_secs() as u32,
-            is_server,
+            is_server: is_server_derived,
         };
-        state.hello_sent = true;
-        state.is_server = is_server;
         
-        // Update the state based on current state and hello_received flag
-        match (state.state, state.hello_received) {
-            (ConnectionState::Connecting, false) => {
+        // Update the state based on current state
+        match state.state {
+            ConnectionState::Connecting => {
                 // No Hello received yet, transition to HelloSent
                 state.state = ConnectionState::HelloSent;
             },
-            (ConnectionState::Connecting, true) | (ConnectionState::HelloReceived, true) => {
+            ConnectionState::HelloReceived => {
                 // We've received Hello and now sending one, transition to Established
                 state.state = ConnectionState::Established;
             },
-            (ConnectionState::HelloReceived, false) => {
-                // This is a rare case - we received a Hello but the flag wasn't set
-                // Update state to Established since we're now sending hello
-                state.state = ConnectionState::Established;
-                tracing::warn!(
-                    peer = %state.remote_addr,
-                    "Unexpected state: HelloReceived with hello_received=false, transitioning to Established"
-                );
-            },
-            (ConnectionState::HelloSent, _) | (ConnectionState::Established, _) => {
+            ConnectionState::HelloSent | ConnectionState::Established => {
                 // Already sent Hello before, maintain current state
             },
-            (ConnectionState::Retry, _) => {
+            ConnectionState::Retry => {
                 // If in retry state, sending Hello means we're now in HelloSent
                 state.state = ConnectionState::HelloSent;
             },
-            (ConnectionState::Closed, _) => {
+            ConnectionState::Closed => {
                 // Sending Hello while closed is unusual but possible during reconnection
                 // Move to HelloSent
                 state.state = ConnectionState::HelloSent;
@@ -401,7 +385,7 @@ impl Peer {
             peer = %state.remote_addr,
             old_state = %state.state,
             "Sending Hello message as {}",
-            if is_server { "server" } else { "client" }
+            if is_server_derived { "server" } else { "client" }
         );
         
         Self::send_message(&state.wire_tx, GeneratedMessage::Hello(hello)).await
@@ -450,8 +434,8 @@ impl Peer {
         async {
             info!("Connection established, sending subscriptions");
             
-            // Only send subscription requests if we're the client or direction is outgoing
-            if !state.is_server || state.direction == ConnectionDirection::Outgoing {
+            // Only send subscription requests if direction is outgoing (we're the client)
+            if state.direction == ConnectionDirection::Outgoing {
                 // Get the list of subscribed VNIs from MetalBond
                 let (tx, rx) = oneshot::channel();
                 if let Err(e) = state.metalbond_tx.send(MetalBondCommand::GetSubscribedVnis(tx)).await {
@@ -531,10 +515,10 @@ impl Peer {
         rx.await.map_err(|e| PeerError::ChannelReceive(e.to_string()).into())
     }
 
-    pub async fn send_hello(&self, is_server: bool) -> Result<()> {
+    pub async fn send_hello(&self) -> Result<()> {
         let (tx, rx) = oneshot::channel();
         self.message_tx
-            .send(PeerMessage::SendHello(is_server, tx))
+            .send(PeerMessage::SendHello(tx))
             .await
             .map_err(|_| anyhow!("Failed to send Hello message"))?;
         rx.await
@@ -607,39 +591,26 @@ impl Peer {
         self.message_tx.clone()
     }
 
+    // Temporary compatibility methods for tests that use the old flags
+    #[cfg(test)]
     pub async fn get_hello_exchange_status(&self) -> Result<(bool, bool)> {
-        let (tx, rx) = oneshot::channel();
-        self.message_tx
-            .send(PeerMessage::GetHelloExchangeStatus(tx))
-            .await
-            .map_err(|_| anyhow!("Failed to send GetHelloExchangeStatus message"))?;
-        rx.await.map_err(|_| anyhow!("Failed to receive hello exchange status"))
-    }
-
-    pub fn set_hello_received(&self, received: bool) {
-        if let Err(e) = self.message_tx.try_send(PeerMessage::SetHelloReceived(received)) {
-            tracing::warn!(
-                peer = %self.remote_addr,
-                "Failed to set hello_received to {}: {}",
-                received,
-                e
-            );
+        let state = self.get_state().await?;
+        match state {
+            ConnectionState::Connecting => Ok((false, false)),
+            ConnectionState::HelloSent => Ok((true, false)),
+            ConnectionState::HelloReceived => Ok((false, true)),
+            ConnectionState::Established => Ok((true, true)),
+            _ => Ok((false, false)),
         }
     }
 
-    pub fn trigger_retry(&self) {
-        if let Err(e) = self.message_tx.try_send(PeerMessage::Retry) {
-            tracing::warn!(
-                peer = %self.remote_addr,
-                "Failed to trigger retry: {}",
-                e
-            );
-        }
+    #[cfg(test)]
+    pub fn set_hello_received(&self, _received: bool) {
+        // This is a no-op now as we use the state machine instead of flags
+        // Tests should use set_state() to change the connection state
     }
-    
-    // Handle connection failure by moving to retry state
+
     pub fn handle_connection_failure(&self) {
-        // Clone all necessary values to avoid borrowing self in the async block
         let addr = self.remote_addr;
         let message_tx = self.message_tx.clone();
         
@@ -926,31 +897,25 @@ async fn handle_incoming_message(peer: &Arc<Peer>, msg: GeneratedMessage) {
 /// * `peer` - The peer instance
 /// * `hello` - The Hello message
 async fn handle_hello_message(peer: &Arc<Peer>, hello: pb::Hello) {
-    // No need to store the address - it's included in the span
     let span = info_span!("hello_handler", is_server = hello.is_server);
     
     async {
         info!("Received Hello message");
         
-        // Mark that we've received a hello message
-        peer.set_hello_received(true);
-        
         // Store the remote's server status
-        let is_remote_server = hello.is_server;
+        let _is_remote_server = hello.is_server;
         
-        // Get current state
+        // Get current state and handle according to FSM rules
         match peer.get_state().await {
             Ok(current_state) => {
                 match current_state {
                     ConnectionState::Connecting => {
                         // We received a Hello before sending one
-                        // Update state to HelloReceived
                         peer.set_state(ConnectionState::HelloReceived);
                         
                         // Send our Hello response
-                        // Determine our is_server status (opposite of remote)
-                        let our_is_server = !is_remote_server;
-                        if let Err(e) = peer.send_hello(our_is_server).await {
+                        // For our server status, use connection direction - we're server if this is an incoming connection
+                        if let Err(e) = peer.send_hello().await {
                             error!("Failed to respond to Hello: {}", e);
                         }
                     },
@@ -972,10 +937,11 @@ async fn handle_hello_message(peer: &Arc<Peer>, hello: pb::Hello) {
                     },
                     ConnectionState::Retry => {
                         // We were in retry mode, now connected
-                        // Send our Hello and go to HelloReceived
                         peer.set_state(ConnectionState::HelloReceived);
-                        let our_is_server = !is_remote_server;
-                        if let Err(e) = peer.send_hello(our_is_server).await {
+                        
+                        // Send our Hello response
+                        // For our server status, use connection direction
+                        if let Err(e) = peer.send_hello().await {
                             error!("Failed to respond to Hello in Retry state: {}", e);
                         }
                     },
@@ -988,8 +954,7 @@ async fn handle_hello_message(peer: &Arc<Peer>, hello: pb::Hello) {
             Err(e) => {
                 error!("Failed to get peer state: {}", e);
                 // Fallback: assume we're connecting and respond with Hello
-                let our_is_server = !is_remote_server;
-                if let Err(e) = peer.send_hello(our_is_server).await {
+                if let Err(e) = peer.send_hello().await {
                     error!("Failed to respond to Hello after state error: {}", e);
                 }
             }

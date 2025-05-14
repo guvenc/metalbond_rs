@@ -286,7 +286,6 @@ impl MetalBond {
             _state.config.clone(),
             _addr,
             direction,
-            _state.is_server,
         );
         
         tracing::debug!(peer = %_addr, "Attempting to connect to remote peer");
@@ -316,7 +315,7 @@ impl MetalBond {
                     
                     // Send Hello message to initiate the protocol
                     tracing::debug!(peer = %_addr, "Sending Hello message");
-                    if let Err(e) = peer.send_hello(_state.is_server).await {
+                    if let Err(e) = peer.send_hello().await {
                         tracing::error!(peer = %_addr, "Failed to send Hello message: {}", e);
                         return Err(anyhow!("Failed to send Hello message: {}", e));
                     }
@@ -435,7 +434,6 @@ impl MetalBond {
                                             config,
                                             addr,
                                             crate::types::ConnectionDirection::Incoming,
-                                            true,
                                         );
 
                                         // Now manually handle the connection
