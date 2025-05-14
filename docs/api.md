@@ -176,7 +176,17 @@ pub enum ConnectionState {
 }
 ```
 
-Represents the state of a peer connection.
+Represents the state of a peer connection within the MetalBond state machine.
+
+#### States
+- `Connecting`: Initial state when a TCP connection is being established
+- `HelloSent`: The local peer has sent a Hello message but hasn't received one
+- `HelloReceived`: The local peer has received a Hello message but hasn't sent one yet
+- `Established`: Both peers have exchanged Hello messages and the connection is fully established
+- `Retry`: A previously established connection has been lost and will be retried
+- `Closed`: The connection has been terminated and resources are being cleaned up
+
+The state machine follows a specific transition flow as documented in the Architecture document. The current state can be queried using `get_peer_state()` method, which is useful for monitoring the health and status of connections.
 
 ## Example Usage
 

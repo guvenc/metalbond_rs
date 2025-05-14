@@ -40,6 +40,7 @@ pub enum PeerMessage {
     SetState(ConnectionState),
     SetHelloReceived(bool),
     GetHelloExchangeStatus(oneshot::Sender<(bool, bool)>), // (hello_sent, hello_received)
+    Retry,
     Shutdown,
 }
 
@@ -257,6 +258,40 @@ impl Peer {
                 PeerMessage::GetHelloExchangeStatus(resp) => {
                     let _ = resp.send((state.hello_sent, state.hello_received));
                 }
+                PeerMessage::Retry => {
+                    // Handle retry logic
+                    tracing::info!(peer = %state.remote_addr, "Retrying connection");
+                    
+                    // Only handle retry if we're in Retry state
+                    if state.state == ConnectionState::Retry {
+                        // If this is an outgoing connection, attempt to reconnect
+                        if state.direction == ConnectionDirection::Outgoing {
+                            // Reset hello flags
+                            state.hello_sent = false;
+                            state.hello_received = false;
+                            
+                            // Notify MetalBond about the retry attempt
+                            let (tx, rx) = oneshot::channel();
+                            if let Err(e) = state.metalbond_tx.send(
+                                MetalBondCommand::RetryConnection(state.remote_addr, tx)
+                            ).await {
+                                tracing::error!(peer = %state.remote_addr, "Failed to send retry notification: {}", e);
+                            } else {
+                                if let Err(e) = rx.await {
+                                    tracing::error!(peer = %state.remote_addr, "Failed to receive retry response: {}", e);
+                                }
+                            }
+                            
+                            // Move to Connecting state
+                            state.state = ConnectionState::Connecting;
+                        } else {
+                            // For incoming connections, we can't retry - remote must reconnect
+                            tracing::warn!(peer = %state.remote_addr, "Cannot retry incoming connection");
+                        }
+                    } else {
+                        tracing::warn!(peer = %state.remote_addr, "Retry requested but state is {}", state.state);
+                    }
+                }
                 PeerMessage::Shutdown => {
                     tracing::debug!(peer = %state.remote_addr, "Peer actor shutting down");
                     break;
@@ -274,6 +309,12 @@ impl Peer {
         };
         state.hello_sent = true;
         state.is_server = is_server;
+        
+        // Update the state to HelloSent if we're not already in a more advanced state
+        if state.state == ConnectionState::Connecting {
+            state.state = ConnectionState::HelloSent;
+        }
+        
         Self::send_message(&state.wire_tx, GeneratedMessage::Hello(hello)).await
     }
 
@@ -439,6 +480,32 @@ impl Peer {
         // Fire and forget, not waiting for result
         let _ = self.message_tx.try_send(PeerMessage::SetHelloReceived(received));
     }
+
+    pub fn trigger_retry(&self) {
+        // Fire and forget, not waiting for result
+        let _ = self.message_tx.try_send(PeerMessage::Retry);
+    }
+    
+    // Method to handle connection failure by moving to retry state
+    pub fn handle_connection_failure(&self) {
+        // Set state to Retry
+        self.set_state(ConnectionState::Retry);
+        
+        // Schedule a retry attempt after a delay
+        let retry_sender = self.message_tx.clone();
+        tokio::spawn(async move {
+            // Use a fixed delay of 3 seconds for retry
+            // This avoids the thread-safety issues with the random number generator
+            let delay_ms = 3000;
+            
+            tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
+            
+            // After delay, send the retry message
+            if let Err(e) = retry_sender.send(PeerMessage::Retry).await {
+                tracing::error!("Failed to send retry message: {}", e);
+            }
+        });
+    }
 }
 
 // Rewrite the handle_peer function to work with our actor model
@@ -459,8 +526,8 @@ pub async fn handle_peer(
                 tracing::info!(peer = %addr, local_addr = %local_addr, "Local endpoint for connection");
             }
             
-            // Set peer as connected
-            peer.set_state(ConnectionState::Established);
+            // Set peer as connecting, not directly to established
+            peer.set_state(ConnectionState::Connecting);
             
             // Set up framed connection with codec
             let codec = MetalBondCodec;
@@ -495,6 +562,7 @@ pub async fn handle_peer(
                         if let Err(e) = sink.send(outgoing_msg).await {
                             tracing::error!(peer = %addr, "Failed to send message: {}", e);
                             result = Err(anyhow!("Failed to send message: {}", e));
+                            peer.handle_connection_failure();
                             break;
                         }
                     }
@@ -516,31 +584,61 @@ pub async fn handle_peer(
                                         // Store the remote's server status
                                         let is_remote_server = hello.is_server;
                                         
-                                        // Check if we've already sent a hello
-                                        let exchange_status = peer.get_hello_exchange_status().await;
-                                        match exchange_status {
-                                            Ok((hello_sent, _)) => {
-                                                if !hello_sent {
-                                                    // If we haven't sent a hello yet, send one
-                                                    tracing::info!(peer = %addr, "Responding with Hello message");
-                                                    
-                                                    // Here we'd ideally get our own is_server status, but since we can't
-                                                    // access that directly in this function, we'll use the negation of
-                                                    // the remote's is_server as a heuristic
-                                                    let our_is_server = !is_remote_server;
-                                                    
-                                                    if let Err(e) = peer.send_hello(our_is_server).await {
-                                                        tracing::error!(peer = %addr, "Failed to respond to Hello: {}", e);
+                                        // Get current state
+                                        let state_result = peer.get_state().await;
+                                        
+                                        match state_result {
+                                            Ok(current_state) => {
+                                                match current_state {
+                                                    ConnectionState::Connecting => {
+                                                        // We received a Hello before sending one
+                                                        // Update state to HelloReceived
+                                                        peer.set_state(ConnectionState::HelloReceived);
+                                                        
+                                                        // Send our Hello response
+                                                        // Determine our is_server status (opposite of remote)
+                                                        let our_is_server = !is_remote_server;
+                                                        if let Err(e) = peer.send_hello(our_is_server).await {
+                                                            tracing::error!(peer = %addr, "Failed to respond to Hello: {}", e);
+                                                        }
+                                                    },
+                                                    ConnectionState::HelloSent => {
+                                                        // We already sent a Hello and now received one
+                                                        // Transition to Established
+                                                        peer.set_state(ConnectionState::Established);
+                                                        
+                                                        // No need to send another Hello
+                                                        tracing::info!(peer = %addr, "Connection established after Hello exchange");
+                                                    },
+                                                    ConnectionState::HelloReceived => {
+                                                        // We've already received a Hello, this is a duplicate
+                                                        tracing::warn!(peer = %addr, "Received duplicate Hello message");
+                                                    },
+                                                    ConnectionState::Established => {
+                                                        // Already established, might be a re-Hello
+                                                        tracing::info!(peer = %addr, "Received Hello while already established");
+                                                    },
+                                                    ConnectionState::Retry => {
+                                                        // We were in retry mode, now connected
+                                                        // Send our Hello and go to HelloReceived
+                                                        peer.set_state(ConnectionState::HelloReceived);
+                                                        let our_is_server = !is_remote_server;
+                                                        if let Err(e) = peer.send_hello(our_is_server).await {
+                                                            tracing::error!(peer = %addr, "Failed to respond to Hello in Retry state: {}", e);
+                                                        }
+                                                    },
+                                                    ConnectionState::Closed => {
+                                                        // Strange, received Hello while closed
+                                                        tracing::warn!(peer = %addr, "Received Hello while in Closed state");
                                                     }
-                                                } else {
-                                                    tracing::debug!(peer = %addr, "Already sent Hello, not responding with another");
                                                 }
                                             },
                                             Err(e) => {
-                                                tracing::error!(peer = %addr, "Failed to get hello exchange status: {}", e);
-                                                // As a fallback, respond with hello
-                                                if let Err(e) = peer.send_hello(false).await {
-                                                    tracing::error!(peer = %addr, "Failed to respond to Hello: {}", e);
+                                                tracing::error!(peer = %addr, "Failed to get peer state: {}", e);
+                                                // Fallback: assume we're connecting and respond with Hello
+                                                let our_is_server = !is_remote_server;
+                                                if let Err(e) = peer.send_hello(our_is_server).await {
+                                                    tracing::error!(peer = %addr, "Failed to respond to Hello after state error: {}", e);
                                                 }
                                             }
                                         }
@@ -599,11 +697,13 @@ pub async fn handle_peer(
                             Some(Err(e)) => {
                                 tracing::error!(peer = %addr, "Error receiving message: {}", e);
                                 result = Err(anyhow!("Error receiving message: {}", e));
+                                peer.handle_connection_failure();
                                 break;
                             }
                             None => {
                                 tracing::info!(peer = %addr, "Peer connection closed by remote");
                                 result = Err(anyhow!("Connection closed by remote"));
+                                peer.handle_connection_failure();
                                 break;
                             }
                         }

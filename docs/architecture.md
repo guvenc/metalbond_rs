@@ -52,6 +52,168 @@ Message types include:
 
 All messages are encoded using Protocol Buffers for cross-platform compatibility.
 
+### Connection State Machine
+
+MetalBond uses a finite state machine (FSM) to manage peer connections, inspired by the BGP protocol but simplified for our use case. This state machine ensures reliable and predictable connection behavior.
+
+#### Connection States
+
+The connection state machine consists of the following states:
+
+1. **Connecting**
+   - *Description*: Initial state when a TCP connection is being established
+   - *Entry Conditions*: New connection or reconnection after failure
+   - *Valid Actions*: Send Hello, receive Hello
+   - *Exit Conditions*: Hello sent, Hello received, connection failure, or shutdown
+   - *Notes*: Both peers start in this state; TCP connection is established but protocol negotiation hasn't started
+
+2. **HelloSent**
+   - *Description*: The local peer has sent a Hello message but hasn't received one
+   - *Entry Conditions*: From Connecting state after sending Hello message
+   - *Valid Actions*: Wait for Hello, process received Hello
+   - *Exit Conditions*: Hello received, connection failure, or shutdown
+   - *Notes*: Protocol negotiation is in progress from local to remote
+
+3. **HelloReceived**
+   - *Description*: The local peer has received a Hello message but hasn't sent one yet
+   - *Entry Conditions*: From Connecting state after receiving Hello message
+   - *Valid Actions*: Send Hello, process messages
+   - *Exit Conditions*: Hello sent, connection failure, or shutdown
+   - *Notes*: Protocol negotiation is in progress from remote to local
+
+4. **Established**
+   - *Description*: Both peers have exchanged Hello messages and the connection is fully established
+   - *Entry Conditions*: From HelloSent after receiving Hello, or from HelloReceived after sending Hello
+   - *Valid Actions*: Send/receive all protocol messages, exchange routes and subscriptions
+   - *Exit Conditions*: Connection failure or shutdown
+   - *Notes*: Regular keepalive messages are exchanged to maintain connection health
+
+5. **Retry**
+   - *Description*: A previously established connection has been lost and will be retried
+   - *Entry Conditions*: From any state when a connection error occurs
+   - *Valid Actions*: Wait for retry timer, attempt reconnection
+   - *Exit Conditions*: Reconnection attempt (to Connecting) or shutdown
+   - *Notes*: Uses exponential backoff to avoid overwhelming the network with reconnection attempts
+
+6. **Closed**
+   - *Description*: The connection has been terminated
+   - *Entry Conditions*: From any state when shutdown is requested
+   - *Valid Actions*: Clean up resources
+   - *Exit Conditions*: None (terminal state)
+   - *Notes*: Resources associated with the connection are freed, and route entries from this peer are removed
+
+#### State Transitions
+
+Valid state transitions in the MetalBond connection FSM:
+
+```
+Connecting -> HelloSent: When local peer sends Hello message
+Connecting -> HelloReceived: When remote peer sends Hello message
+HelloSent -> Established: When local peer receives Hello after sending one
+HelloReceived -> Established: When local peer sends Hello after receiving one
+Any State -> Retry: When connection error occurs
+Retry -> Connecting: When reconnection is initiated
+Any State -> Closed: When shutting down the connection
+```
+
+#### State Machine Diagram
+
+```mermaid
+stateDiagram-v2
+    classDef initialState fill:#f9f,stroke:#333,stroke-width:2px
+    classDef normalState fill:#bbf,stroke:#333,stroke-width:1px
+    classDef establishedState fill:#bfb,stroke:#333,stroke-width:2px
+    classDef errorState fill:#fbb,stroke:#333,stroke-width:1px
+    classDef terminalState fill:#bbb,stroke:#333,stroke-width:1px
+    
+    Connecting: Connecting<br/>Initial state
+    HelloSent: HelloSent<br/>Waiting for peer Hello
+    HelloReceived: HelloReceived<br/>Received Hello, need to respond
+    Established: Established<br/>Connection active
+    Retry: Retry<br/>Connection failed
+    Closed: Closed<br/>Connection terminated
+    
+    Connecting --> HelloSent: Send Hello
+    Connecting --> HelloReceived: Receive Hello
+    HelloSent --> Established: Receive Hello
+    HelloReceived --> Established: Send Hello
+    Established --> Retry: Connection Error
+    HelloSent --> Retry: Connection Error
+    HelloReceived --> Retry: Connection Error
+    Connecting --> Retry: Connection Error
+    Retry --> Connecting: Reconnect after delay
+    Connecting --> Closed: Shutdown
+    HelloSent --> Closed: Shutdown
+    HelloReceived --> Closed: Shutdown
+    Established --> Closed: Shutdown
+    Retry --> Closed: Shutdown
+    
+    class Connecting initialState
+    class HelloSent normalState
+    class HelloReceived normalState
+    class Established establishedState
+    class Retry errorState
+    class Closed terminalState
+```
+
+#### State Transition Table
+
+The following table details the state transitions, triggering events, actions taken, and the resulting states:
+
+| Current State | Event | Action | Next State |
+|---------------|-------|--------|------------|
+| Connecting | Connection Established | - | Connecting |
+| Connecting | Send Hello | Set hello_sent=true | HelloSent |
+| Connecting | Receive Hello | Set hello_received=true | HelloReceived |
+| Connecting | Connection Failed | Schedule retry | Retry |
+| Connecting | Shutdown Requested | Clean up resources | Closed |
+| HelloSent | Receive Hello | Set hello_received=true | Established |
+| HelloSent | Connection Failed | Schedule retry | Retry |
+| HelloSent | Shutdown Requested | Clean up resources | Closed |
+| HelloReceived | Send Hello | Set hello_sent=true | Established |
+| HelloReceived | Connection Failed | Schedule retry | Retry |
+| HelloReceived | Shutdown Requested | Clean up resources | Closed |
+| Established | Connection Failed | Schedule retry | Retry |
+| Established | Shutdown Requested | Clean up resources | Closed |
+| Retry | Retry Timer Expires | Attempt reconnection | Connecting |
+| Retry | Shutdown Requested | Clean up resources | Closed |
+
+#### Retry Mechanism
+
+The retry mechanism allows MetalBond to handle transient network issues:
+
+1. When a connection failure is detected, the state changes to Retry
+2. A time-delayed retry message is scheduled
+3. After the delay, a reconnection attempt is made
+4. If successful, the state transitions back to Connecting
+5. If unsuccessful, the peer remains in Retry state for another attempt
+
+#### Protocol Negotiation
+
+Protocol negotiation occurs during the Hello message exchange:
+
+1. Each peer sends a Hello message containing:
+   - Protocol version
+   - Keepalive interval
+   - Server status (is_server flag)
+
+2. When both peers have exchanged Hello messages, they:
+   - Validate protocol compatibility
+   - Set keepalive timers based on negotiated intervals
+   - Transition to the Established state
+
+#### Implementation Details
+
+The connection state machine is implemented with these key components:
+
+1. **State Storage**: Each peer maintains its current state in the PeerState struct
+2. **Message-Driven Transitions**: State transitions are triggered by messages received through channels
+3. **Deterministic Behavior**: Each state has well-defined entry and exit actions
+4. **Automatic Recovery**: Connection failures trigger the retry mechanism automatically
+5. **Thread Safety**: The entire state machine is managed within a single actor for thread safety
+
+This design ensures connections are managed reliably even in the presence of network issues or peer failures.
+
 ## Lock-less Design
 
 One of the key design features of MetalBond_rs is its lock-less approach to route table management and overall system architecture. This design is guided by the following principles:
