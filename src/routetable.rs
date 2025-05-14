@@ -110,17 +110,22 @@ impl RouteTable {
                                 Some(dest_map) => match dest_map.get_mut(&nh) {
                                     Some(peer_set) => {
                                         if peer_set.remove(&peer) {
-                                            let remaining = peer_set.len();
-
-                                            // Clean up empty maps
-                                            if peer_set.is_empty() {
+                                            let remaining_peers = peer_set.len();
+                                            
+                                            // Clean up empty maps but store whether we need to remove
+                                            let removing_next_hop = peer_set.is_empty();
+                                            if removing_next_hop {
                                                 dest_map.remove(&nh);
-                                            }
-                                            if dest_map.is_empty() {
-                                                vni_map.remove(&dest);
-                                            }
-                                            if vni_map.is_empty() {
-                                                routes.remove(&vni);
+                                                
+                                                // Check if we need to remove the destination too
+                                                if dest_map.is_empty() {
+                                                    vni_map.remove(&dest);
+                                                    
+                                                    // Check if we need to remove the VNI too
+                                                    if vni_map.is_empty() {
+                                                        routes.remove(&vni);
+                                                    }
+                                                }
                                             }
 
                                             // Notify subscribers
@@ -132,7 +137,7 @@ impl RouteTable {
                                                     .await;
                                             }
 
-                                            Ok(remaining)
+                                            Ok(remaining_peers)
                                         } else {
                                             Err(anyhow::anyhow!(
                                                 "Peer {:?} not found for NextHop {}",

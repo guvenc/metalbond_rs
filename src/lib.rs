@@ -6,6 +6,9 @@ pub mod peer;
 pub mod routetable;
 pub mod types;
 
+#[cfg(test)]
+mod tests;
+
 // Conditional export of netlink module based on feature flag
 #[cfg(any(feature = "netlink-support", target_os = "linux"))]
 pub mod netlink;
