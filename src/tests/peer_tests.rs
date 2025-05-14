@@ -1,11 +1,11 @@
+use crate::pb;
 use crate::peer::{GeneratedMessage, Peer};
 use crate::types::{Config, ConnectionDirection, ConnectionState, Destination, UpdateAction, Vni};
-use crate::pb;
 use ipnet::IpNet;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
-use tokio::sync::mpsc;
 use std::time::Duration;
+use tokio::sync::mpsc;
 use tokio::time::timeout;
 
 /**
@@ -20,24 +20,27 @@ use tokio::time::timeout;
 async fn test_peer_creation() {
     // Create channels
     let (mb_tx, _mb_rx) = mpsc::channel(10);
-    
+
     // Create config
     let config = Arc::new(Config::default());
-    
+
     // Create peer
     let remote_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 4711);
     let (peer, mut wire_rx) = Peer::new(mb_tx, config, remote_addr, ConnectionDirection::Outgoing);
-    
+
     // Verify peer properties
     assert_eq!(peer.get_remote_addr(), remote_addr);
-    
+
     // Check initial state
-    let state = timeout(Duration::from_millis(500), peer.get_state()).await.unwrap().unwrap();
+    let state = timeout(Duration::from_millis(500), peer.get_state())
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(state, ConnectionState::Connecting);
-    
+
     // Test shutdown
     peer.trigger_shutdown();
-    
+
     // Wire receiver should eventually close
     let _ = timeout(Duration::from_millis(100), wire_rx.recv()).await;
 }
@@ -54,19 +57,21 @@ async fn test_peer_creation() {
 async fn test_peer_send_hello() {
     // Create channels
     let (mb_tx, _mb_rx) = mpsc::channel(10);
-    
+
     // Create config
     let config = Arc::new(Config::default());
-    
+
     // Create peer
     let remote_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 4711);
     let (peer, mut wire_rx) = Peer::new(mb_tx, config, remote_addr, ConnectionDirection::Outgoing);
-    
+
     // Send a hello message
     let is_server = true;
-    let result = timeout(Duration::from_millis(500), peer.send_hello(is_server)).await.unwrap();
+    let result = timeout(Duration::from_millis(500), peer.send_hello(is_server))
+        .await
+        .unwrap();
     assert!(result.is_ok());
-    
+
     // Check that message was sent to wire
     if let Ok(Some(msg)) = timeout(Duration::from_millis(100), wire_rx.recv()).await {
         match msg {
@@ -79,7 +84,7 @@ async fn test_peer_send_hello() {
     } else {
         panic!("No message was sent to wire");
     }
-    
+
     // Clean up
     peer.trigger_shutdown();
 }
@@ -95,18 +100,20 @@ async fn test_peer_send_hello() {
 async fn test_peer_send_keepalive() {
     // Create channels
     let (mb_tx, _mb_rx) = mpsc::channel(10);
-    
+
     // Create config
     let config = Arc::new(Config::default());
-    
+
     // Create peer
     let remote_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 4711);
     let (peer, mut wire_rx) = Peer::new(mb_tx, config, remote_addr, ConnectionDirection::Outgoing);
-    
+
     // Send a keepalive message
-    let result = timeout(Duration::from_millis(500), peer.send_keepalive()).await.unwrap();
+    let result = timeout(Duration::from_millis(500), peer.send_keepalive())
+        .await
+        .unwrap();
     assert!(result.is_ok());
-    
+
     // Check that message was sent to wire
     if let Ok(Some(msg)) = timeout(Duration::from_millis(100), wire_rx.recv()).await {
         match msg {
@@ -118,7 +125,7 @@ async fn test_peer_send_keepalive() {
     } else {
         panic!("No message was sent to wire");
     }
-    
+
     // Clean up
     peer.trigger_shutdown();
 }
@@ -134,19 +141,21 @@ async fn test_peer_send_keepalive() {
 async fn test_peer_send_subscribe() {
     // Create channels
     let (mb_tx, _mb_rx) = mpsc::channel(10);
-    
+
     // Create config
     let config = Arc::new(Config::default());
-    
+
     // Create peer
     let remote_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 4711);
     let (peer, mut wire_rx) = Peer::new(mb_tx, config, remote_addr, ConnectionDirection::Outgoing);
-    
+
     // Send a subscribe message
     let vni: Vni = 100;
-    let result = timeout(Duration::from_millis(500), peer.send_subscribe(vni)).await.unwrap();
+    let result = timeout(Duration::from_millis(500), peer.send_subscribe(vni))
+        .await
+        .unwrap();
     assert!(result.is_ok());
-    
+
     // Check that message was sent to wire
     if let Ok(Some(msg)) = timeout(Duration::from_millis(100), wire_rx.recv()).await {
         match msg {
@@ -158,7 +167,7 @@ async fn test_peer_send_subscribe() {
     } else {
         panic!("No message was sent to wire");
     }
-    
+
     // Clean up
     peer.trigger_shutdown();
 }
@@ -174,19 +183,21 @@ async fn test_peer_send_subscribe() {
 async fn test_peer_send_unsubscribe() {
     // Create channels
     let (mb_tx, _mb_rx) = mpsc::channel(10);
-    
+
     // Create config
     let config = Arc::new(Config::default());
-    
+
     // Create peer
     let remote_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 4711);
     let (peer, mut wire_rx) = Peer::new(mb_tx, config, remote_addr, ConnectionDirection::Outgoing);
-    
+
     // Send an unsubscribe message
     let vni: Vni = 100;
-    let result = timeout(Duration::from_millis(500), peer.send_unsubscribe(vni)).await.unwrap();
+    let result = timeout(Duration::from_millis(500), peer.send_unsubscribe(vni))
+        .await
+        .unwrap();
     assert!(result.is_ok());
-    
+
     // Check that message was sent to wire
     if let Ok(Some(msg)) = timeout(Duration::from_millis(100), wire_rx.recv()).await {
         match msg {
@@ -198,7 +209,7 @@ async fn test_peer_send_unsubscribe() {
     } else {
         panic!("No message was sent to wire");
     }
-    
+
     // Clean up
     peer.trigger_shutdown();
 }
@@ -215,18 +226,20 @@ async fn test_peer_send_unsubscribe() {
 async fn test_peer_send_update() {
     // Create channels
     let (mb_tx, _mb_rx) = mpsc::channel(10);
-    
+
     // Create config
     let config = Arc::new(Config::default());
-    
+
     // Create peer
     let remote_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 4711);
     let (peer, mut wire_rx) = Peer::new(mb_tx, config, remote_addr, ConnectionDirection::Outgoing);
-    
+
     // Send an update message
     let action = UpdateAction::Add;
     let vni: Vni = 100;
-    let dest = Destination { prefix: IpNet::V4("192.168.1.0/24".parse().unwrap()) };
+    let dest = Destination {
+        prefix: IpNet::V4("192.168.1.0/24".parse().unwrap()),
+    };
     let next_hop = crate::types::NextHop {
         target_address: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
         target_vni: 200,
@@ -234,21 +247,26 @@ async fn test_peer_send_update() {
         nat_port_range_from: 0,
         nat_port_range_to: 0,
     };
-    
-    let result = timeout(Duration::from_millis(500), peer.send_update(action, vni, dest, next_hop)).await.unwrap();
+
+    let result = timeout(
+        Duration::from_millis(500),
+        peer.send_update(action, vni, dest, next_hop),
+    )
+    .await
+    .unwrap();
     assert!(result.is_ok());
-    
+
     // Check that message was sent to wire
     if let Ok(Some(msg)) = timeout(Duration::from_millis(100), wire_rx.recv()).await {
         match msg {
             GeneratedMessage::Update(update) => {
                 assert_eq!(update.action, i32::from(pb::Action::Add));
                 assert_eq!(update.vni, vni);
-                
+
                 let dest_pb = update.destination.unwrap();
                 assert_eq!(dest_pb.ip_version, i32::from(pb::IpVersion::IPv4));
                 assert_eq!(dest_pb.prefix_length, 24);
-                
+
                 let nh_pb = update.next_hop.unwrap();
                 assert_eq!(nh_pb.target_vni, 200);
             }
@@ -257,7 +275,7 @@ async fn test_peer_send_update() {
     } else {
         panic!("No message was sent to wire");
     }
-    
+
     // Clean up
     peer.trigger_shutdown();
 }
@@ -274,14 +292,14 @@ async fn test_peer_send_update() {
 async fn test_peer_state_changes() {
     // Create channels
     let (mb_tx, _mb_rx) = mpsc::channel(10);
-    
+
     // Create config
     let config = Arc::new(Config::default());
-    
+
     // Create peer
     let remote_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 4711);
     let (peer, _wire_rx) = Peer::new(mb_tx, config, remote_addr, ConnectionDirection::Outgoing);
-    
+
     // Helper function to check state
     async fn check_state(peer: &Peer, expected_state: ConnectionState) {
         if let Ok(state_result) = timeout(Duration::from_millis(100), peer.get_state()).await {
@@ -290,31 +308,31 @@ async fn test_peer_state_changes() {
             }
         }
     }
-    
+
     // Initial state should be Connecting
     check_state(&peer, ConnectionState::Connecting).await;
-    
+
     // Change state to HelloSent
     peer.set_state(ConnectionState::HelloSent);
     // Allow time for state change to propagate
     tokio::time::sleep(Duration::from_millis(5)).await;
     check_state(&peer, ConnectionState::HelloSent).await;
-    
+
     // Change state to Established
     peer.set_state(ConnectionState::Established);
     // Allow time for state change to propagate
     tokio::time::sleep(Duration::from_millis(5)).await;
     check_state(&peer, ConnectionState::Established).await;
-    
+
     // Change state to Closed
     peer.set_state(ConnectionState::Closed);
     // Allow time for state change to propagate
     tokio::time::sleep(Duration::from_millis(5)).await;
     check_state(&peer, ConnectionState::Closed).await;
-    
+
     // Clean up - make sure we don't hang
     peer.trigger_shutdown();
-    
+
     // Wait a bit for shutdown to complete
     tokio::time::sleep(Duration::from_millis(100)).await;
-} 
+}

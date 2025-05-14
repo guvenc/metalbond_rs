@@ -1,8 +1,8 @@
-use crate::types::{Destination, NextHop, IpVersion, ConnectionState, UpdateAction};
+use crate::pb;
+use crate::types::{ConnectionState, Destination, IpVersion, NextHop, UpdateAction};
+use ipnet::IpNet;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::str::FromStr;
-use ipnet::IpNet;
-use crate::pb;
 
 /**
  * Tests the string representation of Destination objects.
@@ -12,10 +12,14 @@ use crate::pb;
  */
 #[test]
 fn test_destination_display() {
-    let dest = Destination { prefix: IpNet::V4("192.168.1.0/24".parse().unwrap()) };
+    let dest = Destination {
+        prefix: IpNet::V4("192.168.1.0/24".parse().unwrap()),
+    };
     assert_eq!(dest.to_string(), "192.168.1.0/24");
-    
-    let dest_v6 = Destination { prefix: IpNet::V6("2001:db8::/64".parse().unwrap()) };
+
+    let dest_v6 = Destination {
+        prefix: IpNet::V6("2001:db8::/64".parse().unwrap()),
+    };
     assert_eq!(dest_v6.to_string(), "2001:db8::/64");
 }
 
@@ -30,10 +34,10 @@ fn test_destination_display() {
 fn test_destination_from_str() {
     let dest = Destination::from_str("192.168.1.0/24").unwrap();
     assert_eq!(dest.prefix, IpNet::V4("192.168.1.0/24".parse().unwrap()));
-    
+
     let dest_v6 = Destination::from_str("2001:db8::/64").unwrap();
     assert_eq!(dest_v6.prefix, IpNet::V6("2001:db8::/64".parse().unwrap()));
-    
+
     // Test invalid format
     let result = Destination::from_str("invalid");
     assert!(result.is_err());
@@ -47,10 +51,14 @@ fn test_destination_from_str() {
  */
 #[test]
 fn test_destination_ip_version() {
-    let dest_v4 = Destination { prefix: IpNet::V4("192.168.1.0/24".parse().unwrap()) };
+    let dest_v4 = Destination {
+        prefix: IpNet::V4("192.168.1.0/24".parse().unwrap()),
+    };
     assert_eq!(dest_v4.ip_version(), IpVersion::V4);
-    
-    let dest_v6 = Destination { prefix: IpNet::V6("2001:db8::/64".parse().unwrap()) };
+
+    let dest_v6 = Destination {
+        prefix: IpNet::V6("2001:db8::/64".parse().unwrap()),
+    };
     assert_eq!(dest_v6.ip_version(), IpVersion::V6);
 }
 
@@ -71,7 +79,7 @@ fn test_next_hop_display() {
         nat_port_range_to: 0,
     };
     assert_eq!(nh.to_string(), "10.0.0.1 (VNI: 200)");
-    
+
     let nh_no_vni = NextHop {
         target_address: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
         target_vni: 0,
@@ -80,7 +88,7 @@ fn test_next_hop_display() {
         nat_port_range_to: 0,
     };
     assert_eq!(nh_no_vni.to_string(), "10.0.0.1");
-    
+
     let nh_v6 = NextHop {
         target_address: IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)),
         target_vni: 200,
@@ -124,7 +132,7 @@ fn test_ip_version_conversion() {
     // Test conversion from protobuf enum to our enum
     assert_eq!(IpVersion::from(pb::IpVersion::IPv4), IpVersion::V4);
     assert_eq!(IpVersion::from(pb::IpVersion::IPv6), IpVersion::V6);
-    
+
     // Test conversion from our enum to protobuf enum
     assert_eq!(pb::IpVersion::from(IpVersion::V4), pb::IpVersion::IPv4);
     assert_eq!(pb::IpVersion::from(IpVersion::V6), pb::IpVersion::IPv6);
@@ -143,7 +151,7 @@ fn test_update_action_conversion() {
     // Test conversion from protobuf enum to our enum
     assert_eq!(UpdateAction::from(pb::Action::Add), UpdateAction::Add);
     assert_eq!(UpdateAction::from(pb::Action::Remove), UpdateAction::Remove);
-    
+
     // Test conversion from our enum to protobuf enum
     assert_eq!(pb::Action::from(UpdateAction::Add), pb::Action::Add);
     assert_eq!(pb::Action::from(UpdateAction::Remove), pb::Action::Remove);
@@ -157,7 +165,7 @@ fn test_update_action_conversion() {
 fn test_destination_conversion() {
     // We test the TryFrom/Into implementations between Destination and pb::Destination
     // using the functions in peer.rs
-    
+
     // Test in a separate test module when needed
 }
 
@@ -169,6 +177,6 @@ fn test_destination_conversion() {
 fn test_next_hop_conversion() {
     // We test the TryFrom/Into implementations between NextHop and pb::NextHop
     // using the functions in peer.rs
-    
+
     // Test in a separate test module when needed
-} 
+}

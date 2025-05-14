@@ -111,16 +111,16 @@ impl RouteTable {
                                     Some(peer_set) => {
                                         if peer_set.remove(&peer) {
                                             let remaining_peers = peer_set.len();
-                                            
+
                                             // Clean up empty maps but store whether we need to remove
                                             let removing_next_hop = peer_set.is_empty();
                                             if removing_next_hop {
                                                 dest_map.remove(&nh);
-                                                
+
                                                 // Check if we need to remove the destination too
                                                 if dest_map.is_empty() {
                                                     vni_map.remove(&dest);
-                                                    
+
                                                     // Check if we need to remove the VNI too
                                                     if vni_map.is_empty() {
                                                         routes.remove(&vni);

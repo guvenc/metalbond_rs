@@ -1,9 +1,9 @@
-use crate::peer::GeneratedMessage;
 use crate::pb;
+use crate::peer::GeneratedMessage;
 use crate::types::{MessageType, Vni};
+use anyhow::{anyhow, bail, Result};
 use bytes::BytesMut;
 use tokio_util::codec::{Decoder, Encoder};
-use anyhow::{anyhow, bail, Result};
 
 // Constants copied from peer.rs for testing
 const METALBOND_VERSION: u8 = 1;
@@ -75,28 +75,28 @@ impl Decoder for TestMetalBondCodec {
 fn test_hello_message_serialization() {
     let mut codec = TestMetalBondCodec;
     let mut buffer = BytesMut::new();
-    
+
     // Create Hello message
     let hello = pb::Hello {
         keepalive_interval: 30,
         is_server: true,
     };
     let msg = GeneratedMessage::Hello(hello);
-    
+
     // Encode
     codec.encode(msg, &mut buffer).unwrap();
-    
+
     // Should have header + encoded message
     assert!(buffer.len() > 4);
-    
+
     // Check if the header bytes are correct
     assert_eq!(buffer[0], 1); // Version
-    // buffer[1] and buffer[2] are message length bytes
+                              // buffer[1] and buffer[2] are message length bytes
     assert_eq!(buffer[3], MessageType::Hello as u8);
-    
+
     // Decode
     let decoded = codec.decode(&mut buffer).unwrap().unwrap();
-    
+
     // Verify decoded message
     match decoded {
         GeneratedMessage::Hello(hello) => {
@@ -105,7 +105,7 @@ fn test_hello_message_serialization() {
         }
         _ => panic!("Wrong message type decoded"),
     }
-    
+
     // Buffer should be empty after decode
     assert_eq!(buffer.len(), 0);
 }
@@ -121,22 +121,22 @@ fn test_hello_message_serialization() {
 fn test_subscription_message_serialization() {
     let mut codec = TestMetalBondCodec;
     let mut buffer = BytesMut::new();
-    
+
     // Create Subscription message
     let vni: Vni = 100;
     let subscription = pb::Subscription { vni };
     let msg = GeneratedMessage::Subscribe(subscription);
-    
+
     // Encode
     codec.encode(msg, &mut buffer).unwrap();
-    
+
     // Check header
     assert_eq!(buffer[0], 1); // Version
     assert_eq!(buffer[3], MessageType::Subscribe as u8);
-    
+
     // Decode
     let decoded = codec.decode(&mut buffer).unwrap().unwrap();
-    
+
     // Verify decoded message
     match decoded {
         GeneratedMessage::Subscribe(sub) => {
@@ -157,7 +157,7 @@ fn test_subscription_message_serialization() {
 fn test_update_message_serialization() {
     let mut codec = TestMetalBondCodec;
     let mut buffer = BytesMut::new();
-    
+
     // Create an Update message
     let update = pb::Update {
         action: i32::from(pb::Action::Add),
@@ -175,30 +175,30 @@ fn test_update_message_serialization() {
             nat_port_range_to: 0,
         }),
     };
-    
+
     let msg = GeneratedMessage::Update(update);
-    
+
     // Encode
     codec.encode(msg, &mut buffer).unwrap();
-    
+
     // Check header
     assert_eq!(buffer[0], 1); // Version
     assert_eq!(buffer[3], MessageType::Update as u8);
-    
+
     // Decode
     let decoded = codec.decode(&mut buffer).unwrap().unwrap();
-    
+
     // Verify decoded message
     match decoded {
         GeneratedMessage::Update(update) => {
             assert_eq!(update.action, i32::from(pb::Action::Add));
             assert_eq!(update.vni, 100);
-            
+
             let dest = update.destination.unwrap();
             assert_eq!(dest.ip_version, i32::from(pb::IpVersion::IPv4));
             assert_eq!(dest.prefix, vec![192, 168, 1, 0]);
             assert_eq!(dest.prefix_length, 24);
-            
+
             let nh = update.next_hop.unwrap();
             assert_eq!(nh.target_address, vec![10, 0, 0, 1]);
             assert_eq!(nh.target_vni, 200);
@@ -220,22 +220,22 @@ fn test_update_message_serialization() {
 fn test_keepalive_message_serialization() {
     let mut codec = TestMetalBondCodec;
     let mut buffer = BytesMut::new();
-    
+
     // Create Keepalive message (has no payload)
     let msg = GeneratedMessage::Keepalive;
-    
+
     // Encode
     codec.encode(msg, &mut buffer).unwrap();
-    
+
     // Check header
     assert_eq!(buffer[0], 1); // Version
     assert_eq!(buffer[1], 0); // Length (upper byte)
     assert_eq!(buffer[2], 0); // Length (lower byte)
     assert_eq!(buffer[3], MessageType::Keepalive as u8);
-    
+
     // Decode
     let decoded = codec.decode(&mut buffer).unwrap().unwrap();
-    
+
     // Verify decoded message
     match decoded {
         GeneratedMessage::Keepalive => {
@@ -255,19 +255,19 @@ fn test_keepalive_message_serialization() {
 #[test]
 fn test_malformed_message_handling() {
     let mut codec = TestMetalBondCodec;
-    
+
     // Invalid message type test
     let mut buffer = BytesMut::new();
     buffer.extend_from_slice(&[1, 0, 0, 99]); // Version 1, len 0, invalid type 99
-    
+
     // Should error on decode
     let result = codec.decode(&mut buffer);
     assert!(result.is_err());
-    
+
     // Invalid protocol version test
     let mut buffer = BytesMut::new();
     buffer.extend_from_slice(&[99, 0, 0, 1]); // Version 99, len 0, type Hello
-    
+
     // Should error on decode
     let result = codec.decode(&mut buffer);
     assert!(result.is_err());
@@ -276,27 +276,27 @@ fn test_malformed_message_handling() {
 /**
  * Tests the codec's handling of incomplete messages.
  * Verifies that:
- * 1. When only a header is received (without the full payload), 
+ * 1. When only a header is received (without the full payload),
  *    the codec returns None and waits for more data
  * 2. The codec correctly reserves space for the expected message
  */
 #[test]
 fn test_incomplete_message_handling() {
     let mut codec = TestMetalBondCodec;
-    
+
     // Header only, no payload
     let mut buffer = BytesMut::new();
     buffer.extend_from_slice(&[1, 0, 4, 1]); // Version 1, len 4, type Hello
-    
+
     // Should return None, not enough data
     let result = codec.decode(&mut buffer);
     assert!(result.unwrap().is_none());
-    
+
     // Incomplete header
     let mut buffer = BytesMut::new();
     buffer.extend_from_slice(&[1, 0]); // Only 2 bytes
-    
+
     // Should return None, not enough data
     let result = codec.decode(&mut buffer);
     assert!(result.unwrap().is_none());
-} 
+}

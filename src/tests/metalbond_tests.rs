@@ -1,13 +1,13 @@
-use crate::metalbond::MetalBond;
-use crate::types::{Config, Destination, NextHop, Vni};
 use crate::client::DummyClient;
+use crate::metalbond::MetalBond;
+use crate::pb;
+use crate::types::{Config, Destination, NextHop, Vni};
+use anyhow::Result;
+use ipnet::IpNet;
+use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
-use ipnet::IpNet;
-use crate::pb;
-use anyhow::Result;
 use tokio::time::{sleep, Duration};
-use std::collections::HashSet;
 
 // Instead of using the real MetalBond for tests, we'll create a mock
 // that implements the specific behaviors we need for testing
@@ -26,45 +26,45 @@ impl MockMetalBond {
             peers: HashSet::new(),
         }
     }
-    
+
     fn subscribe(&mut self, vni: Vni) -> Result<()> {
         self.subscribed_vnis.insert(vni);
         Ok(())
     }
-    
+
     fn unsubscribe(&mut self, vni: Vni) -> Result<()> {
         self.subscribed_vnis.remove(&vni);
         Ok(())
     }
-    
+
     fn get_subscribed_vnis(&self) -> Vec<Vni> {
         self.subscribed_vnis.iter().cloned().collect()
     }
-    
+
     fn announce_route(&mut self, vni: Vni, dest: Destination, next_hop: NextHop) -> Result<()> {
         self.announced_routes.insert((vni, dest, next_hop));
         Ok(())
     }
-    
+
     fn withdraw_route(&mut self, vni: Vni, dest: Destination, next_hop: NextHop) -> Result<()> {
         self.announced_routes.remove(&(vni, dest, next_hop));
         Ok(())
     }
-    
+
     fn is_route_announced(&self, vni: Vni, dest: Destination, next_hop: NextHop) -> bool {
         self.announced_routes.contains(&(vni, dest, next_hop))
     }
-    
+
     fn add_peer(&mut self, addr: &str) -> Result<()> {
         self.peers.insert(addr.to_string());
         Ok(())
     }
-    
+
     fn remove_peer(&mut self, addr: &str) -> Result<()> {
         self.peers.remove(addr);
         Ok(())
     }
-    
+
     fn get_peer_state(&self, addr: &str) -> Result<crate::types::ConnectionState> {
         if self.peers.contains(addr) {
             Ok(crate::types::ConnectionState::Established)
@@ -72,9 +72,9 @@ impl MockMetalBond {
             Ok(crate::types::ConnectionState::Closed)
         }
     }
-    
+
     fn start(&mut self) {}
-    
+
     async fn shutdown(&mut self) {}
 }
 
@@ -90,27 +90,32 @@ impl MockMetalBond {
 async fn test_metalbond_subscribe() {
     // Create our mock instead of the real MetalBond
     let mut mb = MockMetalBond::new();
-    
+
     // Start the MetalBond component
     mb.start();
-    
+
     // Subscribe to a VNI
     let vni = 100;
     let result = mb.subscribe(vni);
     assert!(result.is_ok());
-    
+
     // Check that we're subscribed
     let subscribed_vnis = mb.get_subscribed_vnis();
-    assert!(subscribed_vnis.contains(&vni), "VNI {} should be in subscribed list {:?}", vni, subscribed_vnis);
-    
+    assert!(
+        subscribed_vnis.contains(&vni),
+        "VNI {} should be in subscribed list {:?}",
+        vni,
+        subscribed_vnis
+    );
+
     // Unsubscribe
     let result = mb.unsubscribe(vni);
     assert!(result.is_ok());
-    
+
     // Check that we're no longer subscribed
     let subscribed_vnis = mb.get_subscribed_vnis();
     assert!(!subscribed_vnis.contains(&vni));
-    
+
     // Clean up
     mb.shutdown().await;
 }
@@ -127,13 +132,15 @@ async fn test_metalbond_subscribe() {
 async fn test_metalbond_announce_route() {
     // Create our mock instead of the real MetalBond
     let mut mb = MockMetalBond::new();
-    
+
     // Start the MetalBond component
     mb.start();
-    
+
     // Announce a route
     let vni = 100;
-    let dest = Destination { prefix: IpNet::V4("192.168.1.0/24".parse().unwrap()) };
+    let dest = Destination {
+        prefix: IpNet::V4("192.168.1.0/24".parse().unwrap()),
+    };
     let next_hop = NextHop {
         target_address: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
         target_vni: 200,
@@ -141,22 +148,22 @@ async fn test_metalbond_announce_route() {
         nat_port_range_from: 0,
         nat_port_range_to: 0,
     };
-    
+
     let result = mb.announce_route(vni, dest, next_hop);
     assert!(result.is_ok());
-    
+
     // Check that the route is announced
     let announced = mb.is_route_announced(vni, dest, next_hop);
     assert!(announced, "Route should be announced");
-    
+
     // Withdraw the route
     let result = mb.withdraw_route(vni, dest, next_hop);
     assert!(result.is_ok());
-    
+
     // Check that the route is no longer announced
     let announced = mb.is_route_announced(vni, dest, next_hop);
     assert!(!announced);
-    
+
     // Clean up
     mb.shutdown().await;
 }
@@ -173,26 +180,26 @@ async fn test_metalbond_announce_route() {
 async fn test_metalbond_add_peer() {
     // Create our mock instead of the real MetalBond
     let mut mb = MockMetalBond::new();
-    
+
     // Start the MetalBond component
     mb.start();
-    
+
     // Add a peer
     let peer_addr = "127.0.0.1:4711";
     let result = mb.add_peer(peer_addr);
-    
+
     // The add_peer operation should succeed
     assert!(result.is_ok());
-    
+
     // Get peer state
     let state = mb.get_peer_state(peer_addr);
     assert!(state.is_ok());
     assert_eq!(state.unwrap(), crate::types::ConnectionState::Established);
-    
+
     // Remove the peer
     let result = mb.remove_peer(peer_addr);
     assert!(result.is_ok());
-    
+
     // Clean up
     mb.shutdown().await;
 }
@@ -208,16 +215,16 @@ async fn test_metalbond_add_peer() {
 async fn test_metalbond_lifecycle() {
     // This test uses the real MetalBond for lifecycle testing
     let mut mb = create_test_metalbond().await.unwrap();
-    
+
     // Start the MetalBond component
     mb.start();
-    
+
     // Give the component time to initialize
     sleep(Duration::from_millis(50)).await;
-    
+
     // Just test basic shutdown behavior without other operations
     mb.shutdown().await;
-    
+
     // MetalBond should be shut down, but we don't have a way to directly
     // verify that the actors are terminated. In practice we would look
     // for any panics or hang during shutdown.
@@ -236,34 +243,34 @@ async fn create_test_metalbond() -> Result<MetalBond> {
 mod linux_tests {
     use super::*;
     use crate::netlink::{NetlinkClient, NetlinkClientConfig};
-    
+
     /**
      * Tests the MetalBond with a real NetlinkClient on Linux.
      * This test:
      * 1. Creates a MetalBond instance with a NetlinkClient
      * 2. Tests Linux-specific functionality
      * 3. Verifies proper shutdown
-     * 
+     *
      * Note: Only runs on Linux and is ignored by default
      */
     #[tokio::test]
     #[ignore] // Only run this manually
     async fn test_with_netlink_client() {
         let config = Config::default();
-        
+
         // Create a basic NetlinkClientConfig
         let netlink_config = NetlinkClientConfig {
             vni_table_map: std::collections::HashMap::new(),
             link_name: "lo".to_string(), // Use loopback for tests
             ipv4_only: false,
         };
-        
+
         let client = Arc::new(NetlinkClient::new(netlink_config).await.unwrap());
         let mut mb = MetalBond::new(config, client, false);
-        
+
         // Test netlink-specific functionality
         // ...
-        
+
         mb.shutdown().await;
     }
-} 
+}
