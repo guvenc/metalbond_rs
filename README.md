@@ -2,6 +2,15 @@
 
 A Rust implementation of MetalBond networking system with lock-less design.
 
+## Documentation
+
+Comprehensive documentation is available in the [docs](docs/) directory:
+
+- [Installation Guide](docs/installation.md) - How to install and build MetalBond_rs
+- [Usage Guide](docs/usage.md) - How to use MetalBond_rs server and client
+- [Architecture](docs/architecture.md) - Overview of the MetalBond system architecture
+- [API Reference](docs/api.md) - API documentation for developers
+
 ## Project Structure
 
 The project is structured into three main components:
@@ -65,6 +74,8 @@ The project uses conditional compilation to ensure:
 - `netlink-support`: Enables netlink functionality (only compiles on Linux)
 
 ## Usage
+
+For detailed usage information, see the [Usage Guide](docs/usage.md).
 
 ### Server Mode
 
