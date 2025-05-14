@@ -1,10 +1,21 @@
-#![cfg(any(feature = "netlink-support", target_os = "linux"))]
-
 use anyhow::{anyhow, Context, Result};
 use clap::Parser;
 use metalbond::pb;
-use metalbond::{Config, Destination, MetalBond, NetlinkClient, NetlinkClientConfig, NextHop, Vni};
+use metalbond::{Config, Destination, MetalBond, NextHop, Vni};
+
+// Import NetlinkClient and NetlinkClientConfig - these are always available on Linux,
+// or when the netlink-support feature is explicitly enabled
+#[cfg(any(feature = "netlink-support", target_os = "linux"))]
+use metalbond::{NetlinkClient, NetlinkClientConfig};
+
+// Import DummyClient only when netlink support is not active
+#[cfg(not(any(feature = "netlink-support", target_os = "linux")))]
+use metalbond::client::DummyClient;
+
+// Import HashMap conditionally since it's only used with NetlinkClient
+#[cfg(any(feature = "netlink-support", target_os = "linux"))]
 use std::collections::HashMap;
+
 use std::net::IpAddr;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -63,6 +74,15 @@ async fn main() -> Result<()> {
     tracing::subscriber::set_global_default(subscriber)?;
 
     tracing::info!("MetalBond Client Version: {}", env!("CARGO_PKG_VERSION"));
+    
+    #[cfg(target_os = "linux")]
+    tracing::info!("Running on Linux with netlink support enabled");
+    
+    #[cfg(all(not(target_os = "linux"), feature = "netlink-support"))]
+    tracing::info!("Running with netlink support enabled");
+    
+    #[cfg(not(any(feature = "netlink-support", target_os = "linux")))]
+    tracing::info!("Running without netlink support (using DummyClient)");
 
     // ---- Configuration ----
     let mut config = Config::default();
@@ -70,49 +90,84 @@ async fn main() -> Result<()> {
         config.keepalive_interval = Duration::from_secs(secs);
     }
 
-    // Setup OS Client (Netlink)
+    // Setup OS Client based on platform and command line options
+    // Use NetlinkClient when on Linux or when netlink-support feature is enabled
     let os_client: Arc<dyn metalbond::client::Client> = if !cli.install_routes.is_empty() {
-        let tun_name = cli
-            .tun
-            .ok_or_else(|| anyhow!("--tun <DEVICE> is required when using --install-routes"))?;
+        #[cfg(any(feature = "netlink-support", target_os = "linux"))]
+        {
+            let tun_name = cli
+                .tun
+                .ok_or_else(|| anyhow!("--tun <DEVICE> is required when using --install-routes"))?;
 
-        let mut vni_table_map = HashMap::new();
-        for mapping in cli.install_routes {
-            let parts: Vec<&str> = mapping.split('#').collect();
-            if parts.len() != 2 {
-                return Err(anyhow!("Malformed VNI Table mapping: {}", mapping));
+            let mut vni_table_map = HashMap::new();
+            for mapping in cli.install_routes {
+                let parts: Vec<&str> = mapping.split('#').collect();
+                if parts.len() != 2 {
+                    return Err(anyhow!("Malformed VNI Table mapping: {}", mapping));
+                }
+                let vni = Vni::from_str(parts[0])
+                    .with_context(|| format!("Cannot parse VNI: {}", parts[0]))?;
+                let table_id = i32::from_str(parts[1])
+                    .with_context(|| format!("Cannot parse table ID: {}", parts[1]))?;
+                if table_id <= 0 {
+                    return Err(anyhow!(
+                        "Invalid table ID {} in mapping {}",
+                        table_id,
+                        mapping
+                    ));
+                }
+                vni_table_map.insert(vni, table_id);
             }
-            let vni = Vni::from_str(parts[0])
-                .with_context(|| format!("Cannot parse VNI: {}", parts[0]))?;
-            let table_id = i32::from_str(parts[1])
-                .with_context(|| format!("Cannot parse table ID: {}", parts[1]))?;
-            if table_id <= 0 {
-                return Err(anyhow!(
-                    "Invalid table ID {} in mapping {}",
-                    table_id,
-                    mapping
-                ));
-            }
-            vni_table_map.insert(vni, table_id);
+            tracing::info!("VNI to Route Table mapping: {:?}", vni_table_map);
+
+            let nl_config = NetlinkClientConfig {
+                vni_table_map,
+                link_name: tun_name,
+                ipv4_only: cli.ipv4_only,
+            };
+            Arc::new(
+                NetlinkClient::new(nl_config)
+                    .await
+                    .context("Cannot create Netlink Client")?,
+            )
         }
-        tracing::info!("VNI to Route Table mapping: {:?}", vni_table_map);
 
-        let nl_config = NetlinkClientConfig {
-            vni_table_map,
-            link_name: tun_name,
-            ipv4_only: cli.ipv4_only,
-        };
-        Arc::new(
-            NetlinkClient::new(nl_config)
-                .await
-                .context("Cannot create Netlink Client")?,
-        )
+        #[cfg(not(any(feature = "netlink-support", target_os = "linux")))]
+        {
+            tracing::warn!("Install routes specified but netlink support is not available! Using DummyClient instead.");
+            Arc::new(
+                DummyClient::new()
+                    .await
+                    .context("Cannot create Dummy Client")?
+            )
+        }
     } else {
-        Arc::new(
-            metalbond::client::DummyClient::new()
-                .await
-                .context("Cannot create Dummy Client")?
-        )
+        // If no routes need to be installed, use NetlinkClient when on Linux
+        // or when netlink-support feature is enabled
+        #[cfg(any(feature = "netlink-support", target_os = "linux"))]
+        {
+            tracing::info!("Using NetlinkClient");
+            let nl_config = NetlinkClientConfig {
+                vni_table_map: HashMap::new(),
+                link_name: cli.tun.unwrap_or_else(|| "metalbond0".to_string()),
+                ipv4_only: cli.ipv4_only,
+            };
+            Arc::new(
+                NetlinkClient::new(nl_config)
+                    .await
+                    .context("Cannot create Netlink Client")?,
+            )
+        }
+
+        #[cfg(not(any(feature = "netlink-support", target_os = "linux")))]
+        {
+            tracing::info!("Using DummyClient (netlink support not available)");
+            Arc::new(
+                DummyClient::new()
+                    .await
+                    .context("Cannot create Dummy Client")?
+            )
+        }
     };
 
     // Create MetalBond instance
@@ -123,8 +178,16 @@ async fn main() -> Result<()> {
         // Clone the RouteTable directly and wrap in Arc
         let route_table = Arc::new(metalbond.route_table_view.clone());
         tokio::spawn(async move {
-            if let Err(e) = metalbond::http_server::run_http_server(http_addr, route_table).await {
-                tracing::error!("HTTP server failed: {}", e);
+            match metalbond::http_server::run_http_server(http_addr, route_table) {
+                Ok(server) => {
+                    // Start the server and await its completion
+                    if let Err(e) = server.await {
+                        tracing::error!("HTTP server failed: {}", e);
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("Failed to start HTTP server: {}", e);
+                }
             }
         });
     }

@@ -4,7 +4,7 @@ use ipnet::IpNet;
 use metalbond::client::DummyClient;
 use metalbond::types::{Destination, NextHop, Vni};
 use metalbond::{Config, MetalBond};
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, TcpListener};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::time::{sleep, Duration};
@@ -16,6 +16,16 @@ fn test_config() -> Config {
         retry_interval_min: Duration::from_millis(50),
         retry_interval_max: Duration::from_millis(100),
     }
+}
+
+// Helper function to get a free port
+fn get_free_port() -> u16 {
+    // By binding to port 0, the OS will assign a free port
+    let listener = TcpListener::bind("[::]:0").expect("Failed to bind to address");
+    let port = listener.local_addr().expect("Failed to get local address").port();
+    // Drop the listener so the port is released
+    drop(listener);
+    port
 }
 
 // Integration tests for the MetalBond system
@@ -32,7 +42,7 @@ fn test_config() -> Config {
 #[tokio::test]
 async fn test_server_client_basic_connectivity() {
     // Use the default MetalBond port
-    let server_port = 4711;
+    let server_port = get_free_port();
     // Use IPv6 ::1 (localhost) instead of 127.0.0.1
     let server_addr = format!("[::1]:{}", server_port);
 
@@ -89,7 +99,7 @@ async fn test_server_client_basic_connectivity() {
 #[tokio::test]
 async fn test_route_announcement_and_propagation() {
     // Use the default MetalBond port
-    let server_port = 4711;
+    let server_port = get_free_port();
     // Use IPv6 ::1 (localhost) instead of 127.0.0.1
     let server_addr = format!("[::1]:{}", server_port);
 
@@ -176,7 +186,7 @@ async fn test_route_announcement_and_propagation() {
 #[tokio::test]
 async fn test_lockless_concurrency() {
     // Use the default MetalBond port
-    let server_port = 4711;
+    let server_port = get_free_port();
     // Use IPv6 ::1 (localhost) instead of 127.0.0.1
     let server_addr = format!("[::1]:{}", server_port);
 
@@ -411,7 +421,7 @@ async fn test_lockless_concurrency() {
 #[tokio::test]
 async fn test_route_propagation_verification() {
     // Use the default MetalBond port
-    let server_port = 4711;
+    let server_port = get_free_port();
     // Use IPv6 ::1 (localhost) instead of 127.0.0.1
     let server_addr = format!("[::1]:{}", server_port);
 
@@ -538,7 +548,7 @@ async fn test_route_propagation_verification() {
 #[tokio::test]
 async fn test_route_cleanup_on_disconnect() {
     // Use the default MetalBond port
-    let server_port = 4711;
+    let server_port = get_free_port();
     // Use IPv6 ::1 (localhost)
     let server_addr = format!("[::1]:{}", server_port);
 

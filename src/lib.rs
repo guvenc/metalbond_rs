@@ -9,20 +9,27 @@ pub mod types;
 #[cfg(test)]
 mod tests;
 
-// Conditional export of netlink module based on feature flag
-#[cfg(any(feature = "netlink-support", target_os = "linux"))]
+// On Linux, implicitly consider netlink-support to be enabled, regardless of whether
+// the feature was explicitly enabled.
+#[cfg(target_os = "linux")]
+pub mod netlink;
+
+// On non-Linux systems, only include netlink module if the feature is explicitly enabled
+#[cfg(all(not(target_os = "linux"), feature = "netlink-support"))]
 pub mod netlink;
 
 // Re-export main components for easier usage
 pub use crate::metalbond::MetalBond;
 pub use crate::types::{Config, ConnectionState, Destination, NextHop, Vni};
 
-// A dummy client for platforms without netlink support
+// Re-export DummyClient only when netlink-support is not active
 #[cfg(not(any(feature = "netlink-support", target_os = "linux")))]
-pub use crate::client::DummyClient as DefaultNetworkClient;
+pub use crate::client::DummyClient;
 
-// Export NetlinkClient as the default network client on Linux
-#[cfg(any(feature = "netlink-support", target_os = "linux"))]
-pub use crate::netlink::NetlinkClient as DefaultNetworkClient;
-#[cfg(any(feature = "netlink-support", target_os = "linux"))]
+// On Linux, always export the NetlinkClient
+#[cfg(target_os = "linux")]
+pub use crate::netlink::{NetlinkClient, NetlinkClientConfig};
+
+// On non-Linux systems, only export NetlinkClient if the feature is explicitly enabled
+#[cfg(all(not(target_os = "linux"), feature = "netlink-support"))]
 pub use crate::netlink::{NetlinkClient, NetlinkClientConfig};

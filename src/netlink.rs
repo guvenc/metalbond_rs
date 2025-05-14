@@ -1,3 +1,10 @@
+// Netlink support module for Linux systems
+// This module is automatically enabled on Linux systems
+// On non-Linux systems, it's only enabled when the 'netlink-support' feature is explicitly enabled
+// 
+// The module provides NetlinkClient implementation which integrates with the
+// Linux kernel's netlink interface for network route management.
+
 #[cfg(any(feature = "netlink-support", target_os = "linux"))]
 use crate::client::Client;
 #[cfg(any(feature = "netlink-support", target_os = "linux"))]
