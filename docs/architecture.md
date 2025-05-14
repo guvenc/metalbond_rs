@@ -162,21 +162,23 @@ The following table details the state transitions, triggering events, actions ta
 
 | Current State | Event | Action | Next State |
 |---------------|-------|--------|------------|
-| Connecting | Connection Established | - | Connecting |
-| Connecting | Send Hello | Set hello_sent=true | HelloSent |
-| Connecting | Receive Hello | Set hello_received=true | HelloReceived |
-| Connecting | Connection Failed | Schedule retry | Retry |
-| Connecting | Shutdown Requested | Clean up resources | Closed |
-| HelloSent | Receive Hello | Set hello_received=true | Established |
-| HelloSent | Connection Failed | Schedule retry | Retry |
-| HelloSent | Shutdown Requested | Clean up resources | Closed |
-| HelloReceived | Send Hello | Set hello_sent=true | Established |
-| HelloReceived | Connection Failed | Schedule retry | Retry |
-| HelloReceived | Shutdown Requested | Clean up resources | Closed |
-| Established | Connection Failed | Schedule retry | Retry |
-| Established | Shutdown Requested | Clean up resources | Closed |
-| Retry | Retry Timer Expires | Attempt reconnection | Connecting |
-| Retry | Shutdown Requested | Clean up resources | Closed |
+| Connecting | Connection Established | Send ConnectionSetup message to actor | Connecting |
+| Connecting | Send Hello | Send HelloSent message to actor | HelloSent |
+| Connecting | Receive Hello | Send HelloReceived message to actor | HelloReceived |
+| Connecting | Connection Failed | Send ConnectionLost message to actor | Retry |
+| Connecting | Shutdown Requested | Send ConnectionClosed message to actor | Closed |
+| HelloSent | Receive Hello | Send ConnectionEstablished message to actor | Established |
+| HelloSent | Connection Failed | Send ConnectionLost message to actor | Retry |
+| HelloSent | Shutdown Requested | Send ConnectionClosed message to actor | Closed |
+| HelloReceived | Send Hello | Send HelloSent message to actor | Established |
+| HelloReceived | Connection Failed | Send ConnectionLost message to actor | Retry |
+| HelloReceived | Shutdown Requested | Send ConnectionClosed message to actor | Closed |
+| Established | Connection Failed | Send ConnectionLost message to actor | Retry |
+| Established | Shutdown Requested | Send ConnectionClosed message to actor | Closed |
+| Retry | Retry Timer Expires | Send Retry message to actor | Connecting |
+| Retry | Shutdown Requested | Send ConnectionClosed message to actor | Closed |
+
+This approach ensures all state transitions are properly managed by the actor and follow the FSM rules, preventing race conditions that could occur from direct state modification.
 
 #### Retry Mechanism
 
@@ -206,11 +208,29 @@ Protocol negotiation occurs during the Hello message exchange:
 
 The connection state machine is implemented with these key components:
 
-1. **State Storage**: Each peer maintains its current state in the PeerState struct
-2. **Message-Driven Transitions**: State transitions are triggered by messages received through channels
+1. **State Storage**: Each peer maintains its current state in the PeerState struct, which is only modified within the actor thread
+2. **Message-Driven Transitions**: State transitions occur through FSM transition intent messages, not direct state modification
 3. **Deterministic Behavior**: Each state has well-defined entry and exit actions
 4. **Automatic Recovery**: Connection failures trigger the retry mechanism automatically
 5. **Thread Safety**: The entire state machine is managed within a single actor for thread safety
+6. **Race Condition Prevention**: External code sends transition intent messages rather than directly modifying state
+
+This approach eliminates race conditions that could occur when multiple components attempt to modify the peer state concurrently (e.g., when the connection setup process and Hello message handling happen simultaneously).
+
+##### Race Condition Prevention
+
+A key improvement in the FSM implementation is the prevention of race conditions in state transitions:
+
+1. **FSM Transition Intent Messages**: Instead of directly setting state, components send intent messages like `ConnectionSetup`, `HelloSent`, or `HelloReceived`
+2. **Centralized State Transitions**: All state transitions happen within the actor thread, ensuring thread safety
+3. **Strict FSM Rules**: The actor enforces valid state transitions according to the FSM rules
+4. **No Direct State Access**: External components cannot directly modify state
+
+For example, when connection setup code and Hello message handling code both need to modify state:
+- The connection setup sends a `ConnectionSetup` intent message to the actor
+- The Hello handler sends a `HelloReceived` intent message to the actor
+- The actor processes these messages sequentially, ensuring no race conditions occur
+- The actor won't regress from a more advanced state (like HelloSent) to a less advanced state (like Connecting)
 
 This design ensures connections are managed reliably even in the presence of network issues or peer failures.
 
@@ -269,6 +289,29 @@ pub struct Peer {
     message_tx: mpsc::Sender<PeerMessage>,
 }
 ```
+
+The peer actor processes two types of messages:
+1. **API messages**: External requests like sending a Hello message or subscribing to a VNI
+2. **FSM transition intent messages**: Requests to transition the internal state machine
+
+```rust
+pub enum PeerMessage {
+    // API messages
+    SendHello(oneshot::Sender<Result<()>>),
+    SendSubscribe(Vni, oneshot::Sender<Result<()>>),
+    // FSM transition intent messages
+    ConnectionSetup,    // Intent to enter Connecting state
+    HelloSent,          // Intent to transition to HelloSent state
+    HelloReceived,      // Intent to transition to HelloReceived state
+    // More messages...
+}
+```
+
+This design ensures that:
+1. All state transitions follow the FSM rules
+2. State is only modified in a single thread (the actor thread)
+3. Race conditions between different parts of the code are eliminated
+4. Advanced states are never accidentally overwritten by lower states
 
 ### Communication Patterns
 

@@ -90,23 +90,31 @@ pub enum ConnectionDirection {
     Outgoing,
 }
 
-/// Represents the state of a peer connection within the MetalBond state machine.
+/// Connection state for a peer.
 ///
-/// The connection state machine follows a specific transition flow:
-/// - Connecting: Initial state when a TCP connection is being established
-/// - HelloSent: The local peer has sent a Hello message but hasn't received one
-/// - HelloReceived: The local peer has received a Hello message but hasn't sent one yet
-/// - Established: Both peers have exchanged Hello messages and the connection is fully established
-/// - Retry: A previously established connection has been lost and will be retried
-/// - Closed: The connection has been terminated and resources are being cleaned up
+/// This enum represents the states of the Finite State Machine (FSM) that
+/// manages the peer connection lifecycle. The states follow a progression:
+///
+/// CLOSED -> CONNECTING -> (HELLO_SENT or HELLO_RECEIVED) -> ESTABLISHED -> CLOSED
+///                      |                                  |
+///                      +----------------> RETRY <---------+
+///
+/// State transitions should only happen through the actor model to prevent race conditions.
+/// External code should express transition intents rather than directly changing states.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnectionState {
-    Connecting,
-    HelloSent,
-    HelloReceived,
-    Established,
-    Retry,
+    /// Connection is closed
     Closed,
+    /// Connection is being established
+    Connecting,
+    /// Hello message sent, waiting for response
+    HelloSent,
+    /// Hello message received, need to send response
+    HelloReceived,
+    /// Connection established and operational
+    Established,
+    /// Connection failed and will be retried
+    Retry,
 }
 
 impl fmt::Display for ConnectionState {

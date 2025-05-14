@@ -1,3 +1,35 @@
+//! Peer connection handling for MetalBond.
+//!
+//! This module provides the implementation of peer-to-peer connections in the MetalBond VPN,
+//! handling protocol messages, connection establishment, and state management.
+//!
+//! # Architecture
+//!
+//! The peer module uses an actor-based architecture with a Finite State Machine (FSM) to manage
+//! connection state transitions. This architecture provides key benefits:
+//!
+//! 1. **Thread Safety**: All state changes happen within the actor thread
+//! 2. **Race Condition Prevention**: External code sends transition intent messages instead
+//!    of directly modifying state
+//! 3. **Controlled State Transitions**: The FSM ensures only valid state transitions occur
+//!
+//! # Race Condition Prevention
+//!
+//! A key design feature is preventing race conditions in state transitions, especially when
+//! multiple parts of the code might interact with peer state (connection handling, hello
+//! handshake processing, etc.).
+//!
+//! Rather than allowing multiple code paths to directly modify state, all changes must go
+//! through the actor via FSM transition intent messages. This ensures that:
+//!
+//! - State is always modified in a single thread (the actor thread)
+//! - All state transitions follow the FSM rules
+//! - Advanced states are never accidentally overwritten by lower states
+//!
+//! For example, when `handle_hello_message` needs to change state, it sends a `HelloReceived`
+//! message to the actor rather than directly changing state, which could conflict with other
+//! operations like `setup_connection`.
+
 use crate::metalbond::MetalBondCommand;
 use crate::pb;
 use crate::types::{
@@ -48,9 +80,18 @@ pub enum PeerError {
     InvalidMessage(String),
 }
 
-// Messages that can be sent to the Peer actor
+/// Messages that can be sent to the Peer actor
+///
+/// This enum defines all the messages that can be sent to the Peer actor.
+/// These messages serve two purposes:
+/// 1. External API calls (like send hello, subscribe, etc.)
+/// 2. Finite State Machine (FSM) transition intents
+///
+/// The FSM transition intents allow for safe state changes within the actor model,
+/// preventing race conditions by ensuring all state transitions happen in the actor thread.
 #[derive(Debug)]
 pub enum PeerMessage {
+    // External API messages
     SendHello(oneshot::Sender<Result<()>>),
     SendKeepalive(oneshot::Sender<Result<()>>),
     SendSubscribe(Vni, oneshot::Sender<Result<()>>),
@@ -63,16 +104,22 @@ pub enum PeerMessage {
         oneshot::Sender<Result<()>>,
     ),
     GetState(oneshot::Sender<ConnectionState>),
-    SetState(ConnectionState),
     GetConnectionState(oneshot::Sender<ConnectionState>),
-    Retry,
-    Shutdown,
-    ConnectionSetup,
-    HelloSent,
-    HelloReceived,
-    ConnectionEstablished,
-    ConnectionLost,
-    ConnectionClosed,
+    
+    // Legacy direct state setting (will be deprecated)
+    SetState(ConnectionState),
+    
+    // FSM transition intents
+    ConnectionSetup,    // Intent to enter Connecting state
+    HelloSent,          // Intent to transition to HelloSent state
+    HelloReceived,      // Intent to transition to HelloReceived state
+    ConnectionEstablished, // Intent to transition to Established state
+    ConnectionLost,     // Intent to handle connection loss
+    ConnectionClosed,   // Intent to transition to Closed state
+    
+    // Control messages
+    Retry,              // Intent to retry connection
+    Shutdown,           // Intent to shut down actor
 }
 
 #[derive(Debug, Clone)]
@@ -167,6 +214,8 @@ impl Decoder for MetalBondCodec {
 /// 
 /// This struct holds all the data needed by the peer actor to maintain
 /// its connection, track state, and communicate with other components.
+/// The state is only modified within the actor's thread, ensuring thread safety
+/// and preventing race conditions in FSM transitions.
 #[derive(Debug)]
 struct PeerState {
     metalbond_tx: mpsc::Sender<MetalBondCommand>,
@@ -188,6 +237,10 @@ struct PeerState {
 /// Each peer represents a connection to a remote MetalBond instance.
 /// The peer uses the actor model for internal concurrency, exposing
 /// a public API to interact with it.
+///
+/// State transitions are handled through Finite State Machine (FSM) messages,
+/// ensuring that all state changes happen within the actor thread to prevent
+/// race conditions when multiple parts of the code interact with the peer.
 pub struct Peer {
     remote_addr: SocketAddr,
     message_tx: mpsc::Sender<PeerMessage>,
@@ -241,6 +294,11 @@ impl Peer {
         (peer, wire_rx)
     }
 
+    /// The main actor loop that processes messages sent to the peer.
+    ///
+    /// This function implements the actor model and houses the FSM logic.
+    /// All state transitions are handled here in a single thread, preventing
+    /// race conditions that could occur if state were modified from multiple threads.
     async fn actor_loop(mut state: PeerState, mut rx: mpsc::Receiver<PeerMessage>) {
         debug!(peer = %state.remote_addr, "Peer actor starting");
         
@@ -472,6 +530,11 @@ impl Peer {
         Self::send_message(&state.wire_tx, GeneratedMessage::Update(update)).await
     }
 
+    /// Handles the connection setup intent.
+    ///
+    /// This is part of the FSM implementation and transitions to Connecting state
+    /// only if the current state allows it (e.g., from Closed or Retry).
+    /// This prevents races where connection setup could overwrite more advanced states.
     async fn handle_connection_setup(state: &mut PeerState) {
         // Check if the current state allows transition to Connecting
         if state.state == ConnectionState::Closed || state.state == ConnectionState::Retry {
@@ -483,6 +546,10 @@ impl Peer {
         }
     }
 
+    /// Handles the Hello Sent intent.
+    ///
+    /// Part of the FSM implementation that transitions state based on
+    /// sending a Hello message, according to the protocol's state machine rules.
     async fn handle_hello_sent(state: &mut PeerState) {
         // Only transition to HelloSent if in Connecting state
         match state.state {
@@ -504,6 +571,10 @@ impl Peer {
         }
     }
 
+    /// Handles the Hello Received intent.
+    ///
+    /// Part of the FSM implementation that transitions state based on
+    /// receiving a Hello message, according to the protocol's state machine rules.
     async fn handle_hello_received(state: &mut PeerState) {
         // Transition based on current state
         match state.state {
@@ -690,6 +761,11 @@ impl Peer {
         let _ = self.message_tx.try_send(PeerMessage::Shutdown);
     }
 
+    /// Sets the peer's state by sending the appropriate FSM transition message.
+    ///
+    /// This method translates the desired connection state into the appropriate
+    /// FSM transition intent message. This ensures all state changes go through
+    /// the actor's FSM logic, preventing race conditions.
     pub fn set_state(&self, new_state: ConnectionState) {
         // Map ConnectionState to appropriate FSM transition message
         let transition_msg = match new_state {
@@ -778,7 +854,11 @@ impl Peer {
 ///
 /// This function is the core of the peer protocol handling. It manages the
 /// TCP stream, processes incoming messages, sends outgoing messages, and
-/// implements the state machine for the peer connection.
+/// coordinates with the actor-based FSM for state transitions.
+///
+/// Important: This function does not directly modify peer state. Instead,
+/// it sends FSM transition intent messages to the peer actor to ensure thread-safe
+/// state transitions without race conditions.
 ///
 /// # Arguments
 /// * `peer` - The peer instance to handle
@@ -823,6 +903,10 @@ pub async fn handle_peer(
 }
 
 /// Sets up the initial connection state and logging.
+///
+/// Rather than directly setting state, this function sends a ConnectionSetup
+/// intent message to the actor, allowing the FSM to properly manage the state
+/// transition without race conditions.
 ///
 /// # Arguments
 /// * `peer` - The peer instance to handle
@@ -1021,6 +1105,10 @@ async fn handle_incoming_message(peer: &Arc<Peer>, msg: GeneratedMessage) {
 }
 
 /// Handles Hello protocol messages.
+///
+/// This function processes Hello messages and sends the appropriate FSM
+/// transition intent message to the actor. By using FSM transitions instead
+/// of direct state modification, we prevent race conditions.
 ///
 /// # Arguments
 /// * `peer` - The peer instance
