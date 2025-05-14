@@ -78,10 +78,7 @@ impl RouteTable {
     }
 
     // Spawn the actor that manages the route table state
-    pub fn spawn_actor(
-        mut rx: mpsc::Receiver<RouteTableCommand>,
-        view: Self,
-    ) -> JoinHandle<()> {
+    pub fn spawn_actor(mut rx: mpsc::Receiver<RouteTableCommand>, view: Self) -> JoinHandle<()> {
         // The actual state, kept private in the actor
         let mut routes: HashMap<Vni, HashMap<Destination, HashMap<NextHop, HashSet<PeerKey>>>> =
             HashMap::new();

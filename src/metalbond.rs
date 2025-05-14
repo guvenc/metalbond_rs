@@ -1,10 +1,7 @@
 use crate::client::Client;
 use crate::peer::PeerMessage;
 use crate::routetable::{RouteTable, RouteTableCommand};
-use crate::types::{
-    Config, ConnectionState, Destination, InternalUpdate, NextHop,
-    Vni,
-};
+use crate::types::{Config, ConnectionState, Destination, InternalUpdate, NextHop, Vni};
 use anyhow::{anyhow, Context, Result};
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
@@ -29,6 +26,7 @@ pub enum MetalBondCommand {
 }
 
 // Shared state of the system, not wrapped in RwLock
+#[allow(dead_code)]
 struct MetalBondState {
     config: Arc<Config>,
     client: Arc<dyn Client>,

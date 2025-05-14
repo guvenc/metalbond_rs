@@ -63,9 +63,9 @@ mod serialize_vnet_map {
 #[derive(Template)]
 #[template(path = "index.html", escape = "html")]
 struct IndexTemplate {
-    date: String,
-    vnet: BTreeMap<Vni, BTreeMap<Destination, Vec<NextHop>>>, // Use BTreeMap for sorting
-    metalbond_version: String,
+    _date: String,
+    _vnet: BTreeMap<Vni, BTreeMap<Destination, Vec<NextHop>>>, // Use BTreeMap for sorting
+    _metalbond_version: String,
 }
 
 // Helper to get current timestamp string
@@ -102,9 +102,9 @@ async fn get_route_data(State(route_table): State<Arc<RouteTable>>) -> JsonRoute
 async fn main_handler(state: State<Arc<RouteTable>>) -> Result<Html<String>, AppError> {
     let data = get_route_data(state).await;
     let template = IndexTemplate {
-        date: data.date,
-        vnet: data.vnet,
-        metalbond_version: data.metalbond_version,
+        _date: data.date,
+        _vnet: data.vnet,
+        _metalbond_version: data.metalbond_version,
     };
     let html = template.render()?;
     Ok(Html(html))

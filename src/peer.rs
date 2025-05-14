@@ -1,8 +1,8 @@
 use crate::metalbond::MetalBondCommand;
 use crate::pb;
 use crate::types::{
-    Config, ConnectionDirection, ConnectionState, Destination, MessageType,
-    NextHop, UpdateAction, Vni,
+    Config, ConnectionDirection, ConnectionState, Destination, MessageType, NextHop, UpdateAction,
+    Vni,
 };
 use anyhow::{anyhow, bail, Context, Result};
 use bytes::BytesMut;
@@ -16,7 +16,9 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_util::codec::{Decoder, Encoder};
 
 const PEER_TX_BUFFER_SIZE: usize = 256; // How many outbound messages can queue up
+#[allow(dead_code)]
 const METALBOND_VERSION: u8 = 1;
+#[allow(dead_code)]
 const MAX_MESSAGE_LEN: usize = 1188;
 
 // Messages that can be sent to the Peer actor
@@ -70,6 +72,7 @@ impl GeneratedMessage {
     }
 }
 
+#[allow(dead_code)]
 struct MetalBondCodec;
 
 impl Encoder<GeneratedMessage> for MetalBondCodec {
@@ -125,6 +128,7 @@ impl Decoder for MetalBondCodec {
 }
 
 // Internal state for the Peer actor
+#[allow(dead_code)]
 struct PeerState {
     metalbond_tx: mpsc::Sender<MetalBondCommand>,
     config: Arc<Config>,
