@@ -235,7 +235,7 @@ async fn create_test_metalbond() -> Result<MetalBond> {
 #[cfg(target_os = "linux")]
 mod linux_tests {
     use super::*;
-    use crate::netlink::NetlinkClient;
+    use crate::netlink::{NetlinkClient, NetlinkClientConfig};
     
     /**
      * Tests the MetalBond with a real NetlinkClient on Linux.
@@ -250,7 +250,15 @@ mod linux_tests {
     #[ignore] // Only run this manually
     async fn test_with_netlink_client() {
         let config = Config::default();
-        let client = Arc::new(NetlinkClient::new_dummy().await.unwrap());
+        
+        // Create a basic NetlinkClientConfig
+        let netlink_config = NetlinkClientConfig {
+            vni_table_map: std::collections::HashMap::new(),
+            link_name: "lo".to_string(), // Use loopback for tests
+            ipv4_only: false,
+        };
+        
+        let client = Arc::new(NetlinkClient::new(netlink_config).await.unwrap());
         let mut mb = MetalBond::new(config, client, false);
         
         // Test netlink-specific functionality

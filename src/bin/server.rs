@@ -44,7 +44,19 @@ async fn main() -> Result<()> {
     }
 
     // Create appropriate client (dummy on non-Linux)
+    #[cfg(not(any(feature = "netlink-support", target_os = "linux")))]
     let client: Arc<dyn metalbond::client::Client> = Arc::new(DefaultNetworkClient::new().await?);
+
+    #[cfg(any(feature = "netlink-support", target_os = "linux"))]
+    let client: Arc<dyn metalbond::client::Client> = Arc::new({
+        // Create a basic NetlinkClientConfig with default values
+        let netlink_config = metalbond::NetlinkClientConfig {
+            vni_table_map: std::collections::HashMap::new(),
+            link_name: "lo".to_string(), // Default to loopback interface
+            ipv4_only: false,
+        };
+        DefaultNetworkClient::new(netlink_config).await?
+    });
 
     // Create and start the MetalBond instance
     let mut metalbond = MetalBond::new(config, client, true);

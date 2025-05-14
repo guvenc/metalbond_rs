@@ -8,6 +8,16 @@ use tokio::sync::Mutex;
 use tokio::time::{sleep, Duration};
 use ipnet::IpNet;
 
+// Create a default NetlinkClientConfig for testing
+#[cfg(any(feature = "netlink-support", target_os = "linux"))]
+fn test_netlink_config() -> metalbond::NetlinkClientConfig {
+    metalbond::NetlinkClientConfig {
+        vni_table_map: std::collections::HashMap::new(),
+        link_name: "lo".to_string(), // Use loopback for tests
+        ipv4_only: false,
+    }
+}
+
 // Test configuration with short timeouts for faster testing
 fn test_config() -> Config {
     Config {
@@ -35,7 +45,13 @@ async fn test_server_client_basic_connectivity() {
     
     // Start server
     let server_config = test_config();
+    
+    #[cfg(not(any(feature = "netlink-support", target_os = "linux")))]
     let server_client = Arc::new(DefaultNetworkClient::new().await.unwrap());
+    
+    #[cfg(any(feature = "netlink-support", target_os = "linux"))]
+    let server_client = Arc::new(DefaultNetworkClient::new(test_netlink_config()).await.unwrap());
+    
     let mut server = MetalBond::new(server_config, server_client, true);
     server.start();
     
@@ -48,7 +64,13 @@ async fn test_server_client_basic_connectivity() {
     
     // Start client
     let client_config = test_config();
+    
+    #[cfg(not(any(feature = "netlink-support", target_os = "linux")))]
     let client_network = Arc::new(DefaultNetworkClient::new().await.unwrap());
+    
+    #[cfg(any(feature = "netlink-support", target_os = "linux"))]
+    let client_network = Arc::new(DefaultNetworkClient::new(test_netlink_config()).await.unwrap());
+    
     let mut client = MetalBond::new(client_config, client_network, false);
     client.start();
     
@@ -84,7 +106,13 @@ async fn test_route_announcement_and_propagation() {
     
     // Start server
     let server_config = test_config();
+    
+    #[cfg(not(any(feature = "netlink-support", target_os = "linux")))]
     let server_client = Arc::new(DefaultNetworkClient::new().await.unwrap());
+    
+    #[cfg(any(feature = "netlink-support", target_os = "linux"))]
+    let server_client = Arc::new(DefaultNetworkClient::new(test_netlink_config()).await.unwrap());
+    
     let mut server = MetalBond::new(server_config, server_client, true);
     server.start();
     let server_start = server.start_server(server_addr.clone()).await;
@@ -92,12 +120,24 @@ async fn test_route_announcement_and_propagation() {
     
     // Start two clients
     let client1_config = test_config();
+    
+    #[cfg(not(any(feature = "netlink-support", target_os = "linux")))]
     let client1_network = Arc::new(DefaultNetworkClient::new().await.unwrap());
+    
+    #[cfg(any(feature = "netlink-support", target_os = "linux"))]
+    let client1_network = Arc::new(DefaultNetworkClient::new(test_netlink_config()).await.unwrap());
+    
     let mut client1 = MetalBond::new(client1_config, client1_network, false);
     client1.start();
     
     let client2_config = test_config();
+    
+    #[cfg(not(any(feature = "netlink-support", target_os = "linux")))]
     let client2_network = Arc::new(DefaultNetworkClient::new().await.unwrap());
+    
+    #[cfg(any(feature = "netlink-support", target_os = "linux"))]
+    let client2_network = Arc::new(DefaultNetworkClient::new(test_netlink_config()).await.unwrap());
+    
     let mut client2 = MetalBond::new(client2_config, client2_network, false);
     client2.start();
     
@@ -166,7 +206,13 @@ async fn test_lockless_concurrency() {
     
     // Start server
     let server_config = test_config();
+    
+    #[cfg(not(any(feature = "netlink-support", target_os = "linux")))]
     let server_client = Arc::new(DefaultNetworkClient::new().await.unwrap());
+    
+    #[cfg(any(feature = "netlink-support", target_os = "linux"))]
+    let server_client = Arc::new(DefaultNetworkClient::new(test_netlink_config()).await.unwrap());
+    
     let mut server = MetalBond::new(server_config, server_client, true);
     server.start();
     let server_start = server.start_server(server_addr.clone()).await;
@@ -186,7 +232,13 @@ async fn test_lockless_concurrency() {
     let mut client_wrappers = Vec::with_capacity(NUM_CLIENTS);
     for _ in 0..NUM_CLIENTS {
         let client_config = test_config();
+        
+        #[cfg(not(any(feature = "netlink-support", target_os = "linux")))]
         let client_network = Arc::new(DefaultNetworkClient::new().await.unwrap());
+        
+        #[cfg(any(feature = "netlink-support", target_os = "linux"))]
+        let client_network = Arc::new(DefaultNetworkClient::new(test_netlink_config()).await.unwrap());
+        
         let client = MetalBond::new(client_config, client_network, false);
         
         client_wrappers.push(Arc::new(ClientWrapper {
@@ -196,11 +248,12 @@ async fn test_lockless_concurrency() {
     }
     
     // Start clients and connect to server
+    let mut connect_tasks = Vec::new();
     for client_wrapper in &client_wrappers {
         let client_wrapper = client_wrapper.clone();
         let server_addr = server_addr.clone();
         
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             let mut client = client_wrapper.client.lock().await;
             if !client_wrapper.is_started {
                 client.start();
@@ -208,7 +261,13 @@ async fn test_lockless_concurrency() {
                 // (we can't modify the is_started field directly because it's in an Arc)
             }
             client.add_peer(&server_addr).await.unwrap();
-        }).await.unwrap();
+        });
+        connect_tasks.push(task);
+    }
+    
+    // Wait for all connect tasks to complete
+    for task in connect_tasks {
+        task.await.unwrap();
     }
     
     // Wait for all connections to establish
@@ -219,16 +278,23 @@ async fn test_lockless_concurrency() {
     let vnis: Vec<Vni> = (100..100+NUM_VNIS as u32).collect();
     
     // Have each client subscribe to all VNIs
+    let mut subscribe_tasks = Vec::new();
     for client_wrapper in &client_wrappers {
         let client_wrapper = client_wrapper.clone();
         let client_vnis = vnis.clone();
         
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             let client = client_wrapper.client.lock().await;
             for &vni in &client_vnis {
                 client.subscribe(vni).await.unwrap();
             }
-        }).await.unwrap();
+        });
+        subscribe_tasks.push(task);
+    }
+    
+    // Wait for all subscribe tasks to complete
+    for task in subscribe_tasks {
+        task.await.unwrap();
     }
     
     // Wait for subscriptions to propagate

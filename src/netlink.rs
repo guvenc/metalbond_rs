@@ -317,8 +317,7 @@ impl Client for NetlinkClient {
         );
 
         // FIX: Use context for better error message & correct del() usage for rtnetlink v0.14
-        let mut request = self.handle.route().del();
-        *request.message_mut() = route_message;
+        let request = self.handle.route().del(route_message);
         request.execute().await.with_context(|| {
             format!(
                 "Failed to delete route for VNI {} Dest {} NH {}",
