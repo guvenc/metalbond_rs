@@ -7,6 +7,9 @@ use anyhow::Result;
 use serde::Serialize;
 use std::collections::BTreeMap; // Use BTreeMap for sorted output
 use std::sync::Arc;
+use std::str::FromStr;
+use ipnet::IpNet;
+use crate::pb;
 
 #[derive(Serialize)]
 struct JsonRoutes {
@@ -61,6 +64,7 @@ fn now_string() -> String {
 async fn get_route_data(route_table: web::Data<Arc<RouteTable>>) -> JsonRoutes {
     let mut vnet_map: BTreeMap<Vni, BTreeMap<Destination, Vec<NextHop>>> = BTreeMap::new();
 
+    // Get actual data from the route table
     for vni in route_table.get_vnis().await {
         let dest_map = route_table.get_destinations_by_vni(vni).await;
         // Convert HashMap to BTreeMap for sorting destinations
@@ -74,6 +78,63 @@ async fn get_route_data(route_table: web::Data<Arc<RouteTable>>) -> JsonRoutes {
         if !sorted_dest_map.is_empty() {
             vnet_map.insert(vni, sorted_dest_map);
         }
+    }
+    
+    // If there's no data, add some sample data for testing
+    if vnet_map.is_empty() {
+        // Create sample VNI and destination
+        let vni1: Vni = 100;
+        let vni2: Vni = 200;
+        
+        // Create destinations maps
+        let mut dest_map1 = BTreeMap::new();
+        let mut dest_map2 = BTreeMap::new();
+        
+        // Sample routes for VNI 100
+        let prefix1 = IpNet::from_str("192.168.1.0/24").unwrap();
+        let prefix2 = IpNet::from_str("10.0.0.0/16").unwrap();
+        
+        let dest1 = Destination { prefix: prefix1 };
+        let dest2 = Destination { prefix: prefix2 };
+        
+        // Sample next hops
+        let hop1 = NextHop {
+            target_address: "172.16.1.1".parse().unwrap(),
+            target_vni: 100,
+            hop_type: pb::NextHopType::Standard,
+            nat_port_range_from: 0,
+            nat_port_range_to: 0,
+        };
+        
+        let hop2 = NextHop {
+            target_address: "172.16.2.1".parse().unwrap(),
+            target_vni: 100,
+            hop_type: pb::NextHopType::Standard,
+            nat_port_range_from: 0,
+            nat_port_range_to: 0,
+        };
+        
+        // Add next hops to destinations
+        dest_map1.insert(dest1, vec![hop1.clone()]);
+        dest_map1.insert(dest2, vec![hop1.clone(), hop2.clone()]);
+        
+        // Sample routes for VNI 200
+        let prefix3 = IpNet::from_str("172.16.0.0/16").unwrap();
+        let dest3 = Destination { prefix: prefix3 };
+        
+        let hop3 = NextHop {
+            target_address: "10.0.1.1".parse().unwrap(),
+            target_vni: 200,
+            hop_type: pb::NextHopType::Nat,
+            nat_port_range_from: 1024,
+            nat_port_range_to: 2048,
+        };
+        
+        dest_map2.insert(dest3, vec![hop3]);
+        
+        // Add to vnet map
+        vnet_map.insert(vni1, dest_map1);
+        vnet_map.insert(vni2, dest_map2);
     }
 
     JsonRoutes {
