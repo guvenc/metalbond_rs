@@ -10,7 +10,7 @@ This directory contains Wireshark dissector files for analyzing Metalbond protoc
 
 ## Setup Instructions
 
-### Option 1: Using the Lua Dissector
+### Installing the Lua Dissector
 
 1. Copy either `metalbond.lua` (basic) or `metalbond_advanced.lua` (recommended) to your Wireshark plugins directory:
    - Windows: `%APPDATA%\Wireshark\plugins\` or `Wireshark\plugins\` in the installation directory
@@ -20,19 +20,6 @@ This directory contains Wireshark dissector files for analyzing Metalbond protoc
 2. Restart Wireshark
 
 3. Wireshark will now automatically decode Metalbond protocol traffic on TCP port 4711
-
-### Option 2: Using the Protobuf Dissector (Recommended for best results)
-
-1. In Wireshark, go to `Analyze > Decode As...`
-
-2. Add a new entry for TCP port 4711, and select "Protobuf" as the protocol
-
-3. In the Protobuf settings:
-   - Click "Load protobuf file" and select the `metalbond.proto` file
-   - Set message type to `metalbond.MetalbondMessage`
-   - Click "Apply"
-
-4. Wireshark will now decode the Metalbond protocol traffic using the protobuf definitions
 
 ## Capturing Metalbond Traffic
 
