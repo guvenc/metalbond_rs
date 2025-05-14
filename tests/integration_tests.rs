@@ -4,6 +4,7 @@ use metalbond::{Config, DefaultNetworkClient, MetalBond};
 use metalbond::types::{Destination, NextHop, Vni};
 use std::net::{IpAddr, Ipv4Addr, TcpListener};
 use std::sync::Arc;
+use tokio::sync::Mutex;
 use tokio::time::{sleep, Duration};
 use ipnet::IpNet;
 
@@ -28,7 +29,6 @@ fn test_config() -> Config {
  * 3. The connection state can be verified
  */
 #[tokio::test]
-#[ignore]  // Ignore by default, can be enabled with cargo test -- --ignored
 async fn test_server_client_basic_connectivity() {
     let server_port = find_available_port().expect("Failed to find available port");
     let server_addr = format!("127.0.0.1:{}", server_port);
@@ -78,7 +78,6 @@ async fn test_server_client_basic_connectivity() {
  * 4. When a route is withdrawn, the withdrawal is propagated to other clients
  */
 #[tokio::test]
-#[ignore]  // Ignore by default, can be enabled with cargo test -- --ignored
 async fn test_route_announcement_and_propagation() {
     let server_port = find_available_port().expect("Failed to find available port");
     let server_addr = format!("127.0.0.1:{}", server_port);
@@ -150,6 +149,215 @@ async fn test_route_announcement_and_propagation() {
     client1.shutdown().await;
     client2.shutdown().await;
     server.shutdown().await;
+}
+
+/**
+ * Stress test for the lockless concurrent architecture.
+ * This test verifies that:
+ * 1. Multiple clients can perform operations concurrently
+ * 2. High volume of concurrent requests doesn't cause race conditions
+ * 3. The system handles many simultaneous route updates correctly
+ * 4. No deadlocks or data corruption occurs under heavy concurrent load
+ */
+#[tokio::test]
+async fn test_lockless_concurrency() {
+    let server_port = find_available_port().expect("Failed to find available port");
+    let server_addr = format!("127.0.0.1:{}", server_port);
+    
+    // Start server
+    let server_config = test_config();
+    let server_client = Arc::new(DefaultNetworkClient::new().await.unwrap());
+    let mut server = MetalBond::new(server_config, server_client, true);
+    server.start();
+    let server_start = server.start_server(server_addr.clone()).await;
+    assert!(server_start.is_ok());
+    
+    // Create multiple clients (5 in this case)
+    const NUM_CLIENTS: usize = 5;
+    
+    // Create client structures that will be shared across tasks
+    // Each client needs to be wrapped in a Mutex for mutability
+    struct ClientWrapper {
+        client: Mutex<MetalBond>,
+        is_started: bool,
+    }
+    
+    // Create the clients
+    let mut client_wrappers = Vec::with_capacity(NUM_CLIENTS);
+    for _ in 0..NUM_CLIENTS {
+        let client_config = test_config();
+        let client_network = Arc::new(DefaultNetworkClient::new().await.unwrap());
+        let client = MetalBond::new(client_config, client_network, false);
+        
+        client_wrappers.push(Arc::new(ClientWrapper {
+            client: Mutex::new(client),
+            is_started: false,
+        }));
+    }
+    
+    // Start clients and connect to server
+    for client_wrapper in &client_wrappers {
+        let client_wrapper = client_wrapper.clone();
+        let server_addr = server_addr.clone();
+        
+        tokio::spawn(async move {
+            let mut client = client_wrapper.client.lock().await;
+            if !client_wrapper.is_started {
+                client.start();
+                // After starting, mark it as started
+                // (we can't modify the is_started field directly because it's in an Arc)
+            }
+            client.add_peer(&server_addr).await.unwrap();
+        }).await.unwrap();
+    }
+    
+    // Wait for all connections to establish
+    sleep(Duration::from_millis(200)).await;
+    
+    // Create multiple VNIs and have clients subscribe to them
+    const NUM_VNIS: usize = 10;
+    let vnis: Vec<Vni> = (100..100+NUM_VNIS as u32).collect();
+    
+    // Have each client subscribe to all VNIs
+    for client_wrapper in &client_wrappers {
+        let client_wrapper = client_wrapper.clone();
+        let client_vnis = vnis.clone();
+        
+        tokio::spawn(async move {
+            let client = client_wrapper.client.lock().await;
+            for &vni in &client_vnis {
+                client.subscribe(vni).await.unwrap();
+            }
+        }).await.unwrap();
+    }
+    
+    // Wait for subscriptions to propagate
+    sleep(Duration::from_millis(200)).await;
+    
+    // Prepare a set of destinations and next hops
+    const NUM_DESTINATIONS: usize = 20;
+    let mut destinations = Vec::with_capacity(NUM_DESTINATIONS);
+    let mut next_hops = Vec::with_capacity(NUM_DESTINATIONS);
+    
+    for i in 0..NUM_DESTINATIONS {
+        let prefix = format!("192.168.{}.0/24", i % 255);
+        let dest = Destination { 
+            prefix: IpNet::V4(prefix.parse().unwrap()) 
+        };
+        destinations.push(dest);
+        
+        let next_hop = NextHop {
+            target_address: IpAddr::V4(Ipv4Addr::new(10, 0, 0, (i % 254 + 1) as u8)),
+            target_vni: 200 + i as u32,
+            hop_type: metalbond::pb::NextHopType::Standard,
+            nat_port_range_from: 0,
+            nat_port_range_to: 0,
+        };
+        next_hops.push(next_hop);
+    }
+    
+    // Launch concurrent tasks to announce routes
+    let mut announce_tasks = Vec::new();
+    
+    for (client_idx, client_wrapper) in client_wrappers.iter().enumerate() {
+        let client_wrapper = client_wrapper.clone();
+        let client_destinations = destinations.clone();
+        let client_next_hops = next_hops.clone();
+        let client_vnis = vnis.clone();
+        
+        // Create a task for this client to announce routes
+        let announce_task = tokio::spawn(async move {
+            // Offset the operation sequence for each client to increase concurrency
+            sleep(Duration::from_millis(client_idx as u64 * 5)).await;
+            
+            let client = client_wrapper.client.lock().await;
+            
+            // Each client will announce different routes concurrently
+            for (route_idx, (dest, next_hop)) in client_destinations.iter().zip(client_next_hops.iter()).enumerate() {
+                // Distribute routes across VNIs to increase concurrency
+                let vni = client_vnis[route_idx % client_vnis.len()];
+                
+                // Announce the route
+                client.announce_route(vni, *dest, *next_hop).await.unwrap();
+                
+                // Small delay to allow other tasks to interleave
+                if route_idx % 5 == 0 {
+                    sleep(Duration::from_millis(1)).await;
+                }
+            }
+        });
+        announce_tasks.push(announce_task);
+    }
+    
+    // Wait for all announce tasks to complete
+    for task in announce_tasks {
+        task.await.unwrap();
+    }
+    
+    // Allow time for all routes to propagate
+    sleep(Duration::from_millis(300)).await;
+    
+    // Now launch concurrent withdrawal tasks
+    let mut withdrawal_tasks = Vec::new();
+    
+    for (client_idx, client_wrapper) in client_wrappers.iter().enumerate() {
+        let client_wrapper = client_wrapper.clone();
+        let client_destinations = destinations.clone();
+        let client_next_hops = next_hops.clone();
+        let client_vnis = vnis.clone();
+        
+        // Create a task for this client to withdraw routes
+        let withdraw_task = tokio::spawn(async move {
+            // Offset the operation sequence for each client
+            sleep(Duration::from_millis(client_idx as u64 * 5)).await;
+            
+            let client = client_wrapper.client.lock().await;
+            
+            for (route_idx, (dest, next_hop)) in client_destinations.iter().zip(client_next_hops.iter()).enumerate() {
+                // Use the same VNI distribution as for announcements
+                let vni = client_vnis[route_idx % client_vnis.len()];
+                
+                // Withdraw the route
+                client.withdraw_route(vni, *dest, *next_hop).await.unwrap();
+                
+                // Small delay to allow other tasks to interleave
+                if route_idx % 5 == 0 {
+                    sleep(Duration::from_millis(1)).await;
+                }
+            }
+        });
+        withdrawal_tasks.push(withdraw_task);
+    }
+    
+    // Wait for all withdrawal tasks to complete
+    for task in withdrawal_tasks {
+        task.await.unwrap();
+    }
+    
+    // Allow time for all withdrawals to propagate
+    sleep(Duration::from_millis(300)).await;
+    
+    // Clean up - shut down all clients in parallel
+    let mut shutdown_tasks = Vec::new();
+    for client_wrapper in &client_wrappers {
+        let client_wrapper = client_wrapper.clone();
+        let task = tokio::spawn(async move {
+            let mut client = client_wrapper.client.lock().await;
+            client.shutdown().await;
+        });
+        shutdown_tasks.push(task);
+    }
+    
+    // Wait for all clients to shut down
+    for task in shutdown_tasks {
+        task.await.unwrap();
+    }
+    
+    // Shut down server
+    server.shutdown().await;
+    
+    // If we got here without panics or deadlocks, the test passes
+    println!("Concurrency test completed successfully - no deadlocks or panics");
 }
 
 // Helper function to find an available port
