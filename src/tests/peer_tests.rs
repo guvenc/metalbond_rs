@@ -26,7 +26,7 @@ async fn test_peer_creation() {
 
     // Create peer
     let remote_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 4711);
-    let (peer, mut wire_rx) = Peer::new(mb_tx, config, remote_addr, ConnectionDirection::Outgoing);
+    let (peer, mut wire_rx) = Peer::new(mb_tx, config, remote_addr, ConnectionDirection::Outgoing, false);
 
     // Verify peer properties
     assert_eq!(peer.get_remote_addr(), remote_addr);
@@ -63,7 +63,7 @@ async fn test_peer_send_hello() {
 
     // Create peer
     let remote_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 4711);
-    let (peer, mut wire_rx) = Peer::new(mb_tx, config, remote_addr, ConnectionDirection::Outgoing);
+    let (peer, mut wire_rx) = Peer::new(mb_tx, config, remote_addr, ConnectionDirection::Outgoing, false);
 
     // Send a hello message
     let is_server = true;
@@ -106,7 +106,7 @@ async fn test_peer_send_keepalive() {
 
     // Create peer
     let remote_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 4711);
-    let (peer, mut wire_rx) = Peer::new(mb_tx, config, remote_addr, ConnectionDirection::Outgoing);
+    let (peer, mut wire_rx) = Peer::new(mb_tx, config, remote_addr, ConnectionDirection::Outgoing, false);
 
     // Send a keepalive message
     let result = timeout(Duration::from_millis(500), peer.send_keepalive())
@@ -147,7 +147,7 @@ async fn test_peer_send_subscribe() {
 
     // Create peer
     let remote_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 4711);
-    let (peer, mut wire_rx) = Peer::new(mb_tx, config, remote_addr, ConnectionDirection::Outgoing);
+    let (peer, mut wire_rx) = Peer::new(mb_tx, config, remote_addr, ConnectionDirection::Outgoing, false);
 
     // Send a subscribe message
     let vni: Vni = 100;
@@ -189,7 +189,7 @@ async fn test_peer_send_unsubscribe() {
 
     // Create peer
     let remote_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 4711);
-    let (peer, mut wire_rx) = Peer::new(mb_tx, config, remote_addr, ConnectionDirection::Outgoing);
+    let (peer, mut wire_rx) = Peer::new(mb_tx, config, remote_addr, ConnectionDirection::Outgoing, false);
 
     // Send an unsubscribe message
     let vni: Vni = 100;
@@ -232,7 +232,7 @@ async fn test_peer_send_update() {
 
     // Create peer
     let remote_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 4711);
-    let (peer, mut wire_rx) = Peer::new(mb_tx, config, remote_addr, ConnectionDirection::Outgoing);
+    let (peer, mut wire_rx) = Peer::new(mb_tx, config, remote_addr, ConnectionDirection::Outgoing, false);
 
     // Send an update message
     let action = UpdateAction::Add;
@@ -298,7 +298,7 @@ async fn test_peer_state_changes() {
 
     // Create peer
     let remote_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 4711);
-    let (peer, _wire_rx) = Peer::new(mb_tx, config, remote_addr, ConnectionDirection::Outgoing);
+    let (peer, _wire_rx) = Peer::new(mb_tx, config, remote_addr, ConnectionDirection::Outgoing, false);
 
     // Helper function to check state
     async fn check_state(peer: &Peer, expected_state: ConnectionState) {

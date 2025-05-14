@@ -6,6 +6,8 @@ use crate::types::{
 };
 use anyhow::{anyhow, bail, Context, Result};
 use bytes::BytesMut;
+use futures::stream::StreamExt;
+use futures::sink::SinkExt;
 use ipnet::IpNet;
 use prost::Message;
 use std::collections::HashSet;
@@ -36,6 +38,8 @@ pub enum PeerMessage {
     ),
     GetState(oneshot::Sender<ConnectionState>),
     SetState(ConnectionState),
+    SetHelloReceived(bool),
+    GetHelloExchangeStatus(oneshot::Sender<(bool, bool)>), // (hello_sent, hello_received)
     Shutdown,
 }
 
@@ -139,6 +143,9 @@ struct PeerState {
     state: ConnectionState,
     subscribed_vnis_remote: HashSet<Vni>,
     wire_tx: mpsc::Sender<GeneratedMessage>,
+    hello_sent: bool,
+    hello_received: bool,
+    is_server: bool, // Store whether this peer is a server
 }
 
 // Public interface for the Peer
@@ -153,6 +160,7 @@ impl Peer {
         config: Arc<Config>,
         remote_addr: SocketAddr,
         direction: ConnectionDirection,
+        is_server: bool,
     ) -> (Arc<Self>, mpsc::Receiver<GeneratedMessage>) {
         let (wire_tx, wire_rx) = mpsc::channel(PEER_TX_BUFFER_SIZE);
         let (message_tx, message_rx) = mpsc::channel(32);
@@ -168,6 +176,9 @@ impl Peer {
             state: ConnectionState::Connecting,
             subscribed_vnis_remote: HashSet::new(),
             wire_tx,
+            hello_sent: false,
+            hello_received: false,
+            is_server,
         };
 
         // Spawn the actor
@@ -185,7 +196,7 @@ impl Peer {
         while let Some(msg) = rx.recv().await {
             match msg {
                 PeerMessage::SendHello(is_server, resp) => {
-                    let result = Self::handle_send_hello(&state, is_server).await;
+                    let result = Self::handle_send_hello(&mut state, is_server).await;
                     let _ = resp.send(result);
                 }
                 PeerMessage::SendKeepalive(resp) => {
@@ -240,6 +251,12 @@ impl Peer {
                         _ => {}
                     }
                 }
+                PeerMessage::SetHelloReceived(received) => {
+                    state.hello_received = received;
+                }
+                PeerMessage::GetHelloExchangeStatus(resp) => {
+                    let _ = resp.send((state.hello_sent, state.hello_received));
+                }
                 PeerMessage::Shutdown => {
                     tracing::debug!(peer = %state.remote_addr, "Peer actor shutting down");
                     break;
@@ -250,11 +267,13 @@ impl Peer {
     }
 
     // Helper methods for the actor
-    async fn handle_send_hello(state: &PeerState, is_server: bool) -> Result<()> {
+    async fn handle_send_hello(state: &mut PeerState, is_server: bool) -> Result<()> {
         let hello = pb::Hello {
             keepalive_interval: state.config.keepalive_interval.as_secs() as u32,
             is_server,
         };
+        state.hello_sent = true;
+        state.is_server = is_server;
         Self::send_message(&state.wire_tx, GeneratedMessage::Hello(hello)).await
     }
 
@@ -402,16 +421,217 @@ impl Peer {
         // Fire and forget, not waiting for result
         let _ = self.message_tx.try_send(PeerMessage::SetState(new_state));
     }
+
+    pub fn get_message_tx(&self) -> mpsc::Sender<PeerMessage> {
+        self.message_tx.clone()
+    }
+
+    pub async fn get_hello_exchange_status(&self) -> Result<(bool, bool)> {
+        let (tx, rx) = oneshot::channel();
+        self.message_tx
+            .send(PeerMessage::GetHelloExchangeStatus(tx))
+            .await
+            .map_err(|_| anyhow!("Failed to send GetHelloExchangeStatus message"))?;
+        rx.await.map_err(|_| anyhow!("Failed to receive hello exchange status"))
+    }
+
+    pub fn set_hello_received(&self, received: bool) {
+        // Fire and forget, not waiting for result
+        let _ = self.message_tx.try_send(PeerMessage::SetHelloReceived(received));
+    }
 }
 
 // Rewrite the handle_peer function to work with our actor model
 pub async fn handle_peer(
-    _peer: Arc<Peer>,
-    _stream: TcpStream,
-    _wire_rx: mpsc::Receiver<GeneratedMessage>,
+    peer: Arc<Peer>,
+    stream: TcpStream,
+    mut wire_rx: mpsc::Receiver<GeneratedMessage>,
 ) {
-    // Function implementation
-    // ...
+    let addr = peer.get_remote_addr();
+    tracing::info!(peer = %addr, "Starting peer connection handler");
+    
+    let result = match stream.peer_addr() {
+        Ok(peer_addr) => {
+            tracing::info!(peer = %addr, remote_addr = %peer_addr, "Connected to peer");
+            
+            // Get local address info for better debugging
+            if let Ok(local_addr) = stream.local_addr() {
+                tracing::info!(peer = %addr, local_addr = %local_addr, "Local endpoint for connection");
+            }
+            
+            // Set peer as connected
+            peer.set_state(ConnectionState::Established);
+            
+            // Set up framed connection with codec
+            let codec = MetalBondCodec;
+            let framed = tokio_util::codec::Framed::new(stream, codec);
+            let (mut sink, mut stream) = framed.split();
+            
+            tracing::info!(peer = %addr, "Protocol connection established, now handling messages");
+            
+            // Process incoming and outgoing messages in a loop
+            let mut result = Ok(());
+            let mut shutdown_requested = false;
+            
+            while !shutdown_requested {
+                tokio::select! {
+                    Some(outgoing_msg) = wire_rx.recv() => {
+                        match &outgoing_msg {
+                            GeneratedMessage::Hello(_) => tracing::info!(peer = %addr, "Sending Hello message"),
+                            GeneratedMessage::Keepalive => tracing::debug!(peer = %addr, "Sending Keepalive"),
+                            GeneratedMessage::Subscribe(sub) => tracing::info!(peer = %addr, vni = sub.vni, "Sending Subscribe"),
+                            GeneratedMessage::Unsubscribe(unsub) => tracing::info!(peer = %addr, vni = unsub.vni, "Sending Unsubscribe"),
+                            GeneratedMessage::Update(update) => {
+                                let action = if update.action == pb::Action::Add as i32 { "add" } else { "remove" };
+                                tracing::info!(
+                                    peer = %addr, 
+                                    vni = update.vni, 
+                                    action = %action,
+                                    "Sending Update message"
+                                );
+                            }
+                        }
+                        
+                        if let Err(e) = sink.send(outgoing_msg).await {
+                            tracing::error!(peer = %addr, "Failed to send message: {}", e);
+                            result = Err(anyhow!("Failed to send message: {}", e));
+                            break;
+                        }
+                    }
+                    
+                    incoming = stream.next() => {
+                        match incoming {
+                            Some(Ok(msg)) => {
+                                match msg {
+                                    GeneratedMessage::Hello(hello) => {
+                                        tracing::info!(
+                                            peer = %addr, 
+                                            is_server = hello.is_server, 
+                                            "Received Hello message"
+                                        );
+                                        
+                                        // Mark that we've received a hello message
+                                        peer.set_hello_received(true);
+                                        
+                                        // Store the remote's server status
+                                        let is_remote_server = hello.is_server;
+                                        
+                                        // Check if we've already sent a hello
+                                        let exchange_status = peer.get_hello_exchange_status().await;
+                                        match exchange_status {
+                                            Ok((hello_sent, _)) => {
+                                                if !hello_sent {
+                                                    // If we haven't sent a hello yet, send one
+                                                    tracing::info!(peer = %addr, "Responding with Hello message");
+                                                    
+                                                    // Here we'd ideally get our own is_server status, but since we can't
+                                                    // access that directly in this function, we'll use the negation of
+                                                    // the remote's is_server as a heuristic
+                                                    let our_is_server = !is_remote_server;
+                                                    
+                                                    if let Err(e) = peer.send_hello(our_is_server).await {
+                                                        tracing::error!(peer = %addr, "Failed to respond to Hello: {}", e);
+                                                    }
+                                                } else {
+                                                    tracing::debug!(peer = %addr, "Already sent Hello, not responding with another");
+                                                }
+                                            },
+                                            Err(e) => {
+                                                tracing::error!(peer = %addr, "Failed to get hello exchange status: {}", e);
+                                                // As a fallback, respond with hello
+                                                if let Err(e) = peer.send_hello(false).await {
+                                                    tracing::error!(peer = %addr, "Failed to respond to Hello: {}", e);
+                                                }
+                                            }
+                                        }
+                                    }
+                                    GeneratedMessage::Keepalive => {
+                                        tracing::debug!(peer = %addr, "Received Keepalive");
+                                        
+                                        // Respond with our own Keepalive
+                                        if let Err(e) = peer.send_keepalive().await {
+                                            tracing::warn!(peer = %addr, "Failed to respond to Keepalive: {}", e);
+                                        }
+                                    }
+                                    GeneratedMessage::Subscribe(sub) => {
+                                        tracing::info!(peer = %addr, vni = sub.vni, "Received Subscribe for VNI");
+                                        // Handle subscription (logging only for now)
+                                    }
+                                    GeneratedMessage::Unsubscribe(unsub) => {
+                                        tracing::info!(peer = %addr, vni = unsub.vni, "Received Unsubscribe for VNI");
+                                        // Handle unsubscription (logging only for now)
+                                    }
+                                    GeneratedMessage::Update(update) => {
+                                        let action = if update.action == pb::Action::Add as i32 { "add" } else { "remove" };
+                                        
+                                        // Extract destination details for better logging
+                                        let dest_info = if let Some(dest) = &update.destination {
+                                            format!("Prefix: {}/{}", 
+                                                if dest.ip_version == pb::IpVersion::IPv4 as i32 {"IPv4"} else {"IPv6"},
+                                                dest.prefix_length
+                                            )
+                                        } else {
+                                            "Invalid destination".to_string()
+                                        };
+                                        
+                                        // Extract next hop details for better logging
+                                        let nh_info = if let Some(nh) = &update.next_hop {
+                                            format!("NextHop type: {}, VNI: {}", 
+                                                nh.r#type, 
+                                                nh.target_vni
+                                            )
+                                        } else {
+                                            "Invalid next hop".to_string()
+                                        };
+                                        
+                                        tracing::info!(
+                                            peer = %addr, 
+                                            vni = update.vni, 
+                                            action = %action,
+                                            destination = %dest_info,
+                                            next_hop = %nh_info,
+                                            "Received Update message"
+                                        );
+                                        // Process the update (logging only for now)
+                                    }
+                                }
+                            }
+                            Some(Err(e)) => {
+                                tracing::error!(peer = %addr, "Error receiving message: {}", e);
+                                result = Err(anyhow!("Error receiving message: {}", e));
+                                break;
+                            }
+                            None => {
+                                tracing::info!(peer = %addr, "Peer connection closed by remote");
+                                result = Err(anyhow!("Connection closed by remote"));
+                                break;
+                            }
+                        }
+                    }
+                    
+                    else => {
+                        tracing::info!(peer = %addr, "All channels closed, ending peer handler");
+                        shutdown_requested = true;
+                    }
+                }
+            }
+            
+            result
+        }
+        Err(e) => {
+            tracing::error!(peer = %addr, "Failed to get peer address: {}", e);
+            Err(anyhow!("Failed to get peer address: {}", e))
+        }
+    };
+    
+    // Handle connection teardown
+    peer.set_state(ConnectionState::Closed);
+    
+    if let Err(e) = result {
+        tracing::error!(peer = %addr, "Peer handler encountered error: {}", e);
+    }
+    
+    tracing::info!(peer = %addr, "Peer connection handler completed");
 }
 
 impl TryFrom<pb::Destination> for Destination {

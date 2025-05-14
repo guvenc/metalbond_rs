@@ -1,7 +1,7 @@
 use crate::client::Client;
 use crate::peer::PeerMessage;
 use crate::routetable::{RouteTable, RouteTableCommand};
-use crate::types::{Config, ConnectionState, Destination, InternalUpdate, NextHop, Vni};
+use crate::types::{Config, ConnectionState, Destination, InternalUpdate, NextHop, Vni, ConnectionDirection};
 use anyhow::{anyhow, Context, Result};
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
@@ -39,6 +39,7 @@ struct MetalBondState {
     shutdown_notify: Arc<Notify>,
     peer_tasks: HashMap<SocketAddr, JoinHandle<()>>,
     listener_task: Option<JoinHandle<()>>,
+    metalbond_tx: mpsc::Sender<MetalBondCommand>,
 }
 
 // Main MetalBond application struct
@@ -75,6 +76,7 @@ impl MetalBond {
             shutdown_notify: Arc::new(Notify::new()),
             peer_tasks: HashMap::new(),
             listener_task: None,
+            metalbond_tx: command_tx.clone(),
         };
 
         // Spawn the route table actor
@@ -202,8 +204,93 @@ impl MetalBond {
 
     async fn handle_add_peer(_state: &mut MetalBondState, _addr: SocketAddr) -> Result<()> {
         // Implementation of add peer logic
-        // ...
-        Ok(())
+        tracing::info!(peer = %_addr, "Attempting to establish connection to peer");
+        
+        // Check if we already have a connection to this peer
+        if _state.peers.contains_key(&_addr) {
+            tracing::info!(peer = %_addr, "Connection to peer already exists");
+            return Ok(());
+        }
+        
+        // Create a new peer with the correct direction
+        tracing::debug!(peer = %_addr, "Creating new peer instance");
+        let direction = if _state.is_server {
+            ConnectionDirection::Incoming
+        } else {
+            ConnectionDirection::Outgoing
+        };
+        
+        // Create the peer
+        let (peer, wire_rx) = crate::peer::Peer::new(
+            _state.metalbond_tx.clone(),
+            _state.config.clone(),
+            _addr,
+            direction,
+            _state.is_server,
+        );
+        
+        tracing::debug!(peer = %_addr, "Attempting to connect to remote peer");
+        
+        // For outgoing connections, attempt to connect to remote
+        if direction == ConnectionDirection::Outgoing {
+            // Attempt to establish TCP connection
+            tracing::info!(peer = %_addr, "Initiating TCP connection to server");
+            match tokio::net::TcpStream::connect(_addr).await {
+                Ok(stream) => {
+                    let local_addr = match stream.local_addr() {
+                        Ok(addr) => {
+                            tracing::debug!(peer = %_addr, local_addr = %addr, "Local address for connection");
+                            Some(addr)
+                        }
+                        Err(e) => {
+                            tracing::warn!(peer = %_addr, "Failed to get local address: {}", e);
+                            None
+                        }
+                    };
+                    
+                    tracing::info!(
+                        peer = %_addr, 
+                        "TCP connection established successfully (local: {:?})", 
+                        local_addr
+                    );
+                    
+                    // Send Hello message to initiate the protocol
+                    tracing::debug!(peer = %_addr, "Sending Hello message");
+                    if let Err(e) = peer.send_hello(_state.is_server).await {
+                        tracing::error!(peer = %_addr, "Failed to send Hello message: {}", e);
+                        return Err(anyhow!("Failed to send Hello message: {}", e));
+                    }
+                    
+                    // Store peer in state
+                    let peer_sender = peer.get_message_tx();
+                    _state.peers.insert(_addr, peer_sender);
+                    
+                    // Spawn a task to handle this peer
+                    let peer_handle = tokio::spawn(crate::peer::handle_peer(
+                        peer.clone(),
+                        stream,
+                        wire_rx,
+                    ));
+                    _state.peer_tasks.insert(_addr, peer_handle);
+                    
+                    tracing::info!(peer = %_addr, "Peer connection setup complete");
+                    Ok(())
+                }
+                Err(e) => {
+                    tracing::error!(peer = %_addr, "Failed to connect to peer: {}", e);
+                    Err(anyhow!("Failed to connect to peer at {}: {}", _addr, e))
+                }
+            }
+        } else {
+            // For incoming connections, the connection is already established
+            tracing::debug!(peer = %_addr, "Setting up incoming connection");
+            // Store peer in state for later processing when handle_peer is called
+            let peer_sender = peer.get_message_tx();
+            _state.peers.insert(_addr, peer_sender);
+            
+            tracing::info!(peer = %_addr, "Incoming peer connection registered");
+            Ok(())
+        }
     }
 
     async fn handle_remove_peer(_state: &mut MetalBondState, _addr: SocketAddr) -> Result<()> {
@@ -238,13 +325,17 @@ impl MetalBond {
         let listener = TcpListener::bind(&listen_address).await?;
         tracing::info!("Listening on {}", listen_address);
 
+        // Create a modified AddPeer command that can include a TcpStream
+        // This requires adding a command variant to MetalBondCommand
+
         // Spawn a task to accept connections
         let cmd_tx = self.command_tx.clone();
-        let _server_task = tokio::spawn(async move {
+        let server_task = tokio::spawn(async move {
             loop {
                 match listener.accept().await {
-                    Ok((_stream, addr)) => {
+                    Ok((stream, addr)) => {
                         tracing::info!("Accepted connection from {}", addr);
+                        
                         // Set up a peer for this connection
                         let (tx, rx) = oneshot::channel();
                         if let Err(e) = cmd_tx.send(MetalBondCommand::AddPeer(addr, tx)).await {
@@ -253,12 +344,64 @@ impl MetalBond {
                         }
 
                         // Check if peer was added successfully
-                        if let Err(e) = rx.await {
-                            tracing::error!("Failed to get response from AddPeer: {}", e);
-                            continue;
-                        }
+                        match rx.await {
+                            Ok(Ok(_)) => {
+                                // Peer was added, now get access to the peer
+                                let (state_tx, state_rx) = oneshot::channel();
+                                if let Err(e) = cmd_tx.send(MetalBondCommand::GetPeerState(addr, state_tx)).await {
+                                    tracing::error!("Failed to get peer state for {}: {}", addr, e);
+                                    continue;
+                                }
+                                
+                                match state_rx.await {
+                                    Ok(Ok(_state)) => {
+                                        // We'll manually spawn a handler for this connection
+                                        // First get the peer object
+                                        // Ideally, we would request this from MetalBond, but we'll work with current API
+                                        // Create a dummy peer with the exact peer address
+                                        // This is a workaround until we can add a proper GetPeer command to the API
+                                        
+                                        // Create a new peer instance for this connection
+                                        // NOTE: This is a hack. Ideally, we'd reuse the existing peer that was created
+                                        // by AddPeer, but the current API doesn't provide a way to get it.
+                                        let config = Arc::new(Config {
+                                            keepalive_interval: std::time::Duration::from_secs(30),
+                                            retry_interval_min: std::time::Duration::from_millis(100),
+                                            retry_interval_max: std::time::Duration::from_secs(5),
+                                        });
+                                        
+                                        let (peer, wire_rx) = crate::peer::Peer::new(
+                                            cmd_tx.clone(),
+                                            config,
+                                            addr,
+                                            crate::types::ConnectionDirection::Incoming,
+                                            true,
+                                        );
 
-                        // The peer connection handling will be managed by the actor
+                                        // Now manually handle the connection
+                                        tokio::spawn(crate::peer::handle_peer(
+                                            peer.clone(),
+                                            stream,
+                                            wire_rx,
+                                        ));
+                                        
+                                        tracing::info!(peer = %addr, "Successfully created handler for incoming connection");
+                                    },
+                                    Ok(Err(e)) => {
+                                        tracing::error!(peer = %addr, "Error getting peer state: {}", e);
+                                    },
+                                    Err(e) => {
+                                        tracing::error!(peer = %addr, "Channel error getting peer state: {}", e);
+                                    }
+                                }
+                            },
+                            Ok(Err(e)) => {
+                                tracing::error!("Failed to add peer {}: {}", addr, e);
+                            },
+                            Err(e) => {
+                                tracing::error!("Failed to get response from AddPeer: {}", e);
+                            }
+                        };
                     }
                     Err(e) => {
                         tracing::error!("Failed to accept connection: {}", e);
@@ -267,6 +410,9 @@ impl MetalBond {
             }
         });
 
+        // We don't currently have a field in the struct to store this task
+        // but we should set it somewhere to ensure it stays alive
+        self.distributor_task = Some(server_task);
         Ok(())
     }
 
