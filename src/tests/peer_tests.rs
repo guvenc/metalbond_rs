@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::timeout;
+use crate::metalbond::MetalBondCommand;
 
 /**
  * Tests the creation of a Peer object.
@@ -335,4 +336,75 @@ async fn test_peer_state_changes() {
 
     // Wait a bit for shutdown to complete
     tokio::time::sleep(Duration::from_millis(100)).await;
+}
+
+#[tokio::test]
+async fn test_auto_subscription_on_established() {
+    // Setup mock metalbond channel to capture commands
+    let (mb_tx, mut mb_rx) = mpsc::channel(10);
+    let config = Arc::new(Config::default());
+    let remote_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 4711);
+    
+    // Create peer as client (is_server = false)
+    let (peer, mut wire_rx) = Peer::new(
+        mb_tx, 
+        config, 
+        remote_addr, 
+        ConnectionDirection::Outgoing, 
+        false
+    );
+
+    // Set up fake VNIs that will be returned when the peer asks for subscriptions
+    let test_vnis = vec![10, 20, 30];
+    let test_vnis_clone = test_vnis.clone();
+    
+    // Spawn a task to respond to GetSubscribedVnis command
+    tokio::spawn(async move {
+        while let Some(cmd) = mb_rx.recv().await {
+            if let MetalBondCommand::GetSubscribedVnis(tx) = cmd {
+                let _ = tx.send(test_vnis_clone.clone());
+            }
+        }
+    });
+    
+    // Simulate connection becoming established:
+    // 1. First set to HelloSent
+    peer.set_state(ConnectionState::HelloSent);
+    
+    // 2. Then set hello_received to true
+    peer.set_hello_received(true);
+    
+    // 3. Finally transition to Established
+    peer.set_state(ConnectionState::Established);
+    
+    // Verify the state change
+    let state = peer.get_state().await.unwrap();
+    assert_eq!(state, ConnectionState::Established);
+    
+    // Now we should see subscription messages being sent for our test VNIs
+    let mut subscription_count = 0;
+    
+    // Wait for subscription messages, with a timeout
+    for _ in 0..test_vnis.len() {
+        match timeout(Duration::from_millis(500), wire_rx.recv()).await {
+            Ok(Some(msg)) => {
+                match msg {
+                    GeneratedMessage::Subscribe(sub) => {
+                        assert!(test_vnis.contains(&sub.vni), "Unexpected VNI: {}", sub.vni);
+                        subscription_count += 1;
+                    }
+                    _ => panic!("Expected Subscribe message, got {:?}", msg),
+                }
+            }
+            Ok(None) => break,
+            Err(_) => {
+                // Timeout waiting for message
+                break;
+            }
+        }
+    }
+    
+    assert_eq!(subscription_count, test_vnis.len(), 
+               "Expected {} subscription messages, got {}", 
+               test_vnis.len(), subscription_count);
 }

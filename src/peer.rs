@@ -444,9 +444,54 @@ impl Peer {
     }
 
     async fn handle_connection_established(state: &PeerState) {
-        // Send initial subscriptions
-        // For now we're not implementing the detailed logic, just showing the approach
-        tracing::debug!(peer = %state.remote_addr, "Connection established");
+        let peer_addr = state.remote_addr;
+        let span = info_span!("connection_established", peer = %peer_addr);
+        
+        async {
+            info!("Connection established, sending subscriptions");
+            
+            // Only send subscription requests if we're the client or direction is outgoing
+            if !state.is_server || state.direction == ConnectionDirection::Outgoing {
+                // Get the list of subscribed VNIs from MetalBond
+                let (tx, rx) = oneshot::channel();
+                if let Err(e) = state.metalbond_tx.send(MetalBondCommand::GetSubscribedVnis(tx)).await {
+                    error!("Failed to get subscribed VNIs: {}", e);
+                    return;
+                }
+                
+                // Get the list of VNIs
+                let vnis = match rx.await {
+                    Ok(vnis) => vnis,
+                    Err(e) => {
+                        error!("Failed to receive subscribed VNIs: {}", e);
+                        return;
+                    }
+                };
+                
+                // Log the VNIs we're going to subscribe to
+                if vnis.is_empty() {
+                    info!("No VNIs to subscribe to");
+                } else {
+                    info!(vni_count = vnis.len(), "Sending subscription requests");
+                    
+                    // Send subscription for each VNI
+                    for vni in vnis {
+                        let sub = pb::Subscription { vni };
+                        if let Err(e) = Self::send_message(&state.wire_tx, GeneratedMessage::Subscribe(sub)).await {
+                            warn!(vni = vni, "Failed to send subscription: {}", e);
+                        } else {
+                            debug!(vni = vni, "Sent subscription request");
+                        }
+                    }
+                    
+                    info!("All subscription requests sent");
+                }
+            } else {
+                info!("Not sending subscriptions as we're the server for this connection");
+            }
+        }
+        .instrument(span)
+        .await;
     }
 
     async fn handle_connection_lost(state: &PeerState) {
