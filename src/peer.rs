@@ -67,6 +67,12 @@ pub enum PeerMessage {
     GetConnectionState(oneshot::Sender<ConnectionState>),
     Retry,
     Shutdown,
+    ConnectionSetup,
+    HelloSent,
+    HelloReceived,
+    ConnectionEstablished,
+    ConnectionLost,
+    ConnectionClosed,
 }
 
 #[derive(Debug, Clone)]
@@ -339,6 +345,30 @@ impl Peer {
                         rx.close(); // Close the channel instead of using break
                         return; // Exit the async block
                     }
+                    PeerMessage::ConnectionSetup => {
+                        // Handle connection setup intent
+                        Self::handle_connection_setup(&mut state).await;
+                    }
+                    PeerMessage::HelloSent => {
+                        // Handle HelloSent intent
+                        Self::handle_hello_sent(&mut state).await;
+                    }
+                    PeerMessage::HelloReceived => {
+                        // Handle HelloReceived intent
+                        Self::handle_hello_received(&mut state).await;
+                    }
+                    PeerMessage::ConnectionEstablished => {
+                        // Handle connection established intent
+                        Self::handle_connection_established(&state).await;
+                    }
+                    PeerMessage::ConnectionLost => {
+                        // Handle connection lost intent
+                        Self::handle_connection_lost(&state).await;
+                    }
+                    PeerMessage::ConnectionClosed => {
+                        // Handle connection closed intent
+                        Self::handle_connection_closed(&mut state).await;
+                    }
                 }
             }
             .instrument(msg_span)
@@ -357,30 +387,6 @@ impl Peer {
             is_server: is_server_derived,
         };
         
-        // Update the state based on current state
-        match state.state {
-            ConnectionState::Connecting => {
-                // No Hello received yet, transition to HelloSent
-                state.state = ConnectionState::HelloSent;
-            },
-            ConnectionState::HelloReceived => {
-                // We've received Hello and now sending one, transition to Established
-                state.state = ConnectionState::Established;
-            },
-            ConnectionState::HelloSent | ConnectionState::Established => {
-                // Already sent Hello before, maintain current state
-            },
-            ConnectionState::Retry => {
-                // If in retry state, sending Hello means we're now in HelloSent
-                state.state = ConnectionState::HelloSent;
-            },
-            ConnectionState::Closed => {
-                // Sending Hello while closed is unusual but possible during reconnection
-                // Move to HelloSent
-                state.state = ConnectionState::HelloSent;
-            },
-        }
-        
         tracing::debug!(
             peer = %state.remote_addr,
             old_state = %state.state,
@@ -388,7 +394,46 @@ impl Peer {
             if is_server_derived { "server" } else { "client" }
         );
         
-        Self::send_message(&state.wire_tx, GeneratedMessage::Hello(hello)).await
+        // First send the message
+        let result = Self::send_message(&state.wire_tx, GeneratedMessage::Hello(hello)).await;
+        
+        // If sending was successful, update state based on FSM rules
+        if result.is_ok() {
+            // Handle state transitions internally to handle_send_hello
+            // This avoids the need to go through the actor loop for this specific case
+            match state.state {
+                ConnectionState::Connecting => {
+                    // No Hello received yet, transition to HelloSent
+                    state.state = ConnectionState::HelloSent;
+                    info!(from = %ConnectionState::Connecting, to = %ConnectionState::HelloSent, "Transitioning state (internal)");
+                },
+                ConnectionState::HelloReceived => {
+                    // We've received Hello and now sending one, transition to Established
+                    state.state = ConnectionState::Established;
+                    info!(from = %ConnectionState::HelloReceived, to = %ConnectionState::Established, "Transitioning state (internal)");
+                    
+                    // Also perform established actions
+                    Self::handle_connection_established(&state).await;
+                },
+                ConnectionState::HelloSent | ConnectionState::Established => {
+                    // Already sent Hello before, maintain current state
+                    debug!(current = %state.state, "Maintaining current state on hello_sent");
+                },
+                ConnectionState::Retry => {
+                    // If in retry state, sending Hello means we're now in HelloSent
+                    state.state = ConnectionState::HelloSent;
+                    info!(from = %ConnectionState::Retry, to = %ConnectionState::HelloSent, "Transitioning state (internal)");
+                },
+                ConnectionState::Closed => {
+                    // Sending Hello while closed is unusual but possible during reconnection
+                    // Move to HelloSent
+                    state.state = ConnectionState::HelloSent;
+                    info!(from = %ConnectionState::Closed, to = %ConnectionState::HelloSent, "Transitioning state (internal)");
+                },
+            }
+        }
+        
+        result
     }
 
     async fn handle_send_keepalive(state: &PeerState) -> Result<()> {
@@ -425,6 +470,59 @@ impl Peer {
             next_hop: Some(pb_nh),
         };
         Self::send_message(&state.wire_tx, GeneratedMessage::Update(update)).await
+    }
+
+    async fn handle_connection_setup(state: &mut PeerState) {
+        // Check if the current state allows transition to Connecting
+        if state.state == ConnectionState::Closed || state.state == ConnectionState::Retry {
+            state.state = ConnectionState::Connecting;
+            info!(from = %ConnectionState::Closed, to = %ConnectionState::Connecting, "Transitioning state");
+        } else {
+            // If already in a more advanced state, don't regress
+            info!(current = %state.state, "Maintaining current state during connection setup");
+        }
+    }
+
+    async fn handle_hello_sent(state: &mut PeerState) {
+        // Only transition to HelloSent if in Connecting state
+        match state.state {
+            ConnectionState::Connecting => {
+                state.state = ConnectionState::HelloSent;
+                info!(from = %ConnectionState::Connecting, to = %ConnectionState::HelloSent, "Transitioning state");
+            },
+            ConnectionState::HelloReceived => {
+                // If we received a Hello and now sending one, we're established
+                state.state = ConnectionState::Established;
+                info!(from = %ConnectionState::HelloReceived, to = %ConnectionState::Established, "Transitioning state");
+                
+                // Perform established actions
+                Self::handle_connection_established(&state).await;
+            },
+            _ => {
+                info!(current = %state.state, "Not changing state on hello_sent");
+            }
+        }
+    }
+
+    async fn handle_hello_received(state: &mut PeerState) {
+        // Transition based on current state
+        match state.state {
+            ConnectionState::Connecting => {
+                state.state = ConnectionState::HelloReceived;
+                info!(from = %ConnectionState::Connecting, to = %ConnectionState::HelloReceived, "Transitioning state");
+            },
+            ConnectionState::HelloSent => {
+                // We sent Hello and now received one, we're established
+                state.state = ConnectionState::Established;
+                info!(from = %ConnectionState::HelloSent, to = %ConnectionState::Established, "Transitioning state");
+                
+                // Perform established actions
+                Self::handle_connection_established(&state).await;
+            },
+            _ => {
+                info!(current = %state.state, "Not changing state on hello_received");
+            }
+        }
     }
 
     async fn handle_connection_established(state: &PeerState) {
@@ -479,14 +577,30 @@ impl Peer {
     }
 
     async fn handle_connection_lost(state: &PeerState) {
-        // Notify MetalBond to remove routes from this peer
-        let (tx, rx) = oneshot::channel();
-        let _ = state
-            .metalbond_tx
-            .send(MetalBondCommand::RemovePeer(state.remote_addr, tx))
-            .await;
-        if let Err(e) = rx.await {
-            tracing::error!(peer = %state.remote_addr, "Failed to clean up peer: {}", e);
+        // Only handle if we were previously established
+        if state.state == ConnectionState::Established {
+            info!("Connection lost, cleaning up peer resources");
+            
+            // Notify MetalBond to remove routes from this peer
+            let (tx, rx) = oneshot::channel();
+            let _ = state
+                .metalbond_tx
+                .send(MetalBondCommand::RemovePeer(state.remote_addr, tx))
+                .await;
+            if let Err(e) = rx.await {
+                error!(peer = %state.remote_addr, "Failed to clean up peer: {}", e);
+            }
+        }
+    }
+
+    async fn handle_connection_closed(state: &mut PeerState) {
+        let old_state = state.state;
+        state.state = ConnectionState::Closed;
+        info!(from = %old_state, to = %ConnectionState::Closed, "Connection closed");
+        
+        // If we were previously established, clean up
+        if old_state == ConnectionState::Established {
+            Self::handle_connection_lost(state).await;
         }
     }
 
@@ -577,10 +691,21 @@ impl Peer {
     }
 
     pub fn set_state(&self, new_state: ConnectionState) {
-        if let Err(e) = self.message_tx.try_send(PeerMessage::SetState(new_state)) {
+        // Map ConnectionState to appropriate FSM transition message
+        let transition_msg = match new_state {
+            ConnectionState::Connecting => PeerMessage::ConnectionSetup,
+            ConnectionState::HelloSent => PeerMessage::HelloSent,
+            ConnectionState::HelloReceived => PeerMessage::HelloReceived,
+            ConnectionState::Established => PeerMessage::ConnectionEstablished,
+            ConnectionState::Retry => PeerMessage::Retry,
+            ConnectionState::Closed => PeerMessage::ConnectionClosed,
+        };
+        
+        // Send the FSM transition message
+        if let Err(e) = self.message_tx.try_send(transition_msg) {
             tracing::warn!(
                 peer = %self.remote_addr,
-                "Failed to set state to {}: {}",
+                "Failed to send transition to {}: {}",
                 new_state,
                 e
             );
@@ -682,8 +807,10 @@ pub async fn handle_peer(
             Err(e) => Err(e),
         };
         
-        // Handle connection teardown
-        peer.set_state(ConnectionState::Closed);
+        // Handle connection teardown through FSM
+        if let Err(e) = peer.message_tx.send(PeerMessage::ConnectionClosed).await {
+            error!("Failed to send connection closed message: {}", e);
+        }
         
         if let Err(e) = result {
             error!("Peer handler encountered error: {}", e);
@@ -717,8 +844,10 @@ async fn setup_connection(peer: &Arc<Peer>, stream: &TcpStream) -> Result<()> {
         info!(local_addr = %local_addr, "Local endpoint for connection");
     }
     
-    // Set peer as connecting, not directly to established
-    peer.set_state(ConnectionState::Connecting);
+    // Send connection setup intent to FSM handler
+    if let Err(e) = peer.message_tx.send(PeerMessage::ConnectionSetup).await {
+        warn!("Failed to send connection setup message: {}", e);
+    }
     
     Ok(())
 }
@@ -911,7 +1040,11 @@ async fn handle_hello_message(peer: &Arc<Peer>, hello: pb::Hello) {
                 match current_state {
                     ConnectionState::Connecting => {
                         // We received a Hello before sending one
-                        peer.set_state(ConnectionState::HelloReceived);
+                        // Send the HelloReceived event to the actor
+                        if let Err(e) = peer.message_tx.send(PeerMessage::HelloReceived).await {
+                            error!("Failed to send HelloReceived message: {}", e);
+                            return;
+                        }
                         
                         // Send our Hello response
                         // For our server status, use connection direction - we're server if this is an incoming connection
@@ -921,8 +1054,11 @@ async fn handle_hello_message(peer: &Arc<Peer>, hello: pb::Hello) {
                     },
                     ConnectionState::HelloSent => {
                         // We already sent a Hello and now received one
-                        // Transition to Established
-                        peer.set_state(ConnectionState::Established);
+                        // Send the ConnectionEstablished event to the actor
+                        if let Err(e) = peer.message_tx.send(PeerMessage::ConnectionEstablished).await {
+                            error!("Failed to send ConnectionEstablished message: {}", e);
+                            return;
+                        }
                         
                         // No need to send another Hello
                         info!("Connection established after Hello exchange");
@@ -937,7 +1073,11 @@ async fn handle_hello_message(peer: &Arc<Peer>, hello: pb::Hello) {
                     },
                     ConnectionState::Retry => {
                         // We were in retry mode, now connected
-                        peer.set_state(ConnectionState::HelloReceived);
+                        // Send the HelloReceived event to the actor
+                        if let Err(e) = peer.message_tx.send(PeerMessage::HelloReceived).await {
+                            error!("Failed to send HelloReceived message: {}", e);
+                            return;
+                        }
                         
                         // Send our Hello response
                         // For our server status, use connection direction
