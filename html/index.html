@@ -1,0 +1,317 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MetalBond Route Dashboard</title>
+    <style>
+        body {
+            font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+            margin: 0;
+            padding: 0;
+            color: #333;
+            line-height: 1.6;
+            background-color: #f9fafb;
+        }
+        header {
+            background-color: #fff;
+            padding: 20px 30px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.05);
+            margin-bottom: 30px;
+            border-bottom: 1px solid #eee;
+        }
+        h1 {
+            font-size: 24px;
+            font-weight: 600;
+            margin: 0 0 5px 0;
+            color: #111;
+        }
+        .info {
+            color: #666;
+            font-size: 14px;
+            margin-bottom: 5px;
+        }
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 0 20px;
+        }
+        .vni-container {
+            margin-bottom: 30px;
+            background-color: #fff;
+            border-radius: 8px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.05);
+            overflow: hidden;
+        }
+        .vni-heading {
+            background-color: #f0f4f8;
+            padding: 15px 20px;
+            font-weight: 600;
+            font-size: 16px;
+            color: #1a3a65;
+            border-bottom: 1px solid #e0e7f0;
+        }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-bottom: 0;
+        }
+        th, td {
+            text-align: left;
+            padding: 15px 20px;
+            border-bottom: 1px solid #eee;
+        }
+        th {
+            font-weight: 600;
+            color: #555;
+            background-color: #fafbfc;
+            border-bottom: 2px solid #eee;
+        }
+        tr:last-child td {
+            border-bottom: none;
+        }
+        tr:hover {
+            background-color: #f9f9f9;
+        }
+        .links {
+            margin-top: 20px;
+            padding: 15px 0;
+            text-align: center;
+            border-top: 1px solid #eee;
+            background-color: #fff;
+            box-shadow: 0 -2px 4px rgba(0,0,0,0.02);
+        }
+        .links a {
+            margin: 0 15px;
+            color: #0077cc;
+            text-decoration: none;
+            font-weight: 500;
+            font-size: 14px;
+            padding: 6px 12px;
+            border-radius: 4px;
+            transition: background-color 0.2s;
+        }
+        .links a:hover {
+            background-color: #f0f7ff;
+            text-decoration: none;
+        }
+        .empty-message {
+            padding: 30px;
+            color: #666;
+            font-style: italic;
+            text-align: center;
+            background-color: #fff;
+            border-radius: 8px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.05);
+        }
+        .next-hop {
+            margin: 8px 0;
+            padding: 12px 15px;
+            background-color: #f8f9fa;
+            border-radius: 6px;
+            border-left: 4px solid #0077cc;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.05);
+        }
+        .hop-address {
+            font-size: 15px;
+            margin-bottom: 6px;
+            color: #333;
+        }
+        .hop-details {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 12px;
+            font-size: 13px;
+            color: #666;
+        }
+        .hop-details span {
+            display: inline-block;
+            background-color: #e9ecef;
+            padding: 4px 10px;
+            border-radius: 4px;
+            font-weight: 500;
+        }
+        .refresh-button {
+            position: fixed;
+            bottom: 20px;
+            right: 20px;
+            background-color: #0077cc;
+            color: white;
+            border: none;
+            border-radius: 50%;
+            width: 50px;
+            height: 50px;
+            font-size: 20px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.2);
+            cursor: pointer;
+            transition: transform 0.2s, background-color 0.2s;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        .refresh-button:hover {
+            background-color: #005fa3;
+            transform: scale(1.05);
+        }
+        .refresh-button:active {
+            transform: scale(0.95);
+        }
+        /* Responsive styles */
+        @media (max-width: 768px) {
+            .hop-details {
+                flex-direction: column;
+                gap: 6px;
+            }
+            th, td {
+                padding: 10px 15px;
+            }
+        }
+    </style>
+</head>
+<body>
+    <header>
+        <div class="container">
+            <h1>MetalBond Route Dashboard</h1>
+            <div id="version" class="info">Version: Loading...</div>
+            <div id="timestamp" class="info">Last updated: Loading...</div>
+        </div>
+    </header>
+
+    <div class="container">
+        <div id="content">
+            <!-- Route data will be inserted here via JavaScript -->
+            <div class="empty-message">
+                Loading route data...
+            </div>
+        </div>
+
+        <div class="links">
+            <a href="/routes.json" target="_blank">Download as JSON</a>
+            <a href="/routes.yaml" target="_blank">Download as YAML</a>
+        </div>
+    </div>
+
+    <button id="refresh-button" class="refresh-button" title="Refresh Data">↻</button>
+
+    <script>
+        // Fetch route data and populate the UI
+        async function loadRouteData() {
+            try {
+                // Show loading state
+                document.getElementById('content').innerHTML = `
+                    <div class="empty-message">
+                        Loading route data...
+                    </div>
+                `;
+                
+                // Make the fetch request with credentials
+                const response = await fetch('/routes.json', {
+                    method: 'GET',
+                    headers: {
+                        'Accept': 'application/json',
+                        'Content-Type': 'application/json'
+                    },
+                    cache: 'no-cache'
+                });
+                
+                if (!response.ok) {
+                    throw new Error(`Server returned ${response.status}: ${response.statusText}`);
+                }
+                
+                const data = await response.json();
+                
+                // Update version and timestamp
+                document.getElementById('version').textContent = `Version: ${data.metalbond_version || 'Unknown'}`;
+                document.getElementById('timestamp').textContent = `Last updated: ${data.date || 'Unknown'}`;
+                
+                // Display route data
+                displayRouteData(data);
+            } catch (error) {
+                console.error('Error loading route data:', error);
+                document.getElementById('content').innerHTML = `
+                    <div class="empty-message">
+                        Error loading route data: ${error.message}
+                    </div>
+                `;
+            }
+        }
+
+        function displayRouteData(data) {
+            const contentElement = document.getElementById('content');
+            
+            if (!data.vnet || Object.keys(data.vnet).length === 0) {
+                contentElement.innerHTML = `
+                    <div class="empty-message">
+                        No routes are currently available.
+                    </div>
+                `;
+                return;
+            }
+
+            let html = '';
+            
+            for (const [vni, destinations] of Object.entries(data.vnet)) {
+                html += `
+                    <div class="vni-container">
+                        <div class="vni-heading">VNI: ${vni}</div>
+                        <table>
+                            <thead>
+                                <tr>
+                                    <th>Destination</th>
+                                    <th>Next Hops</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                `;
+                
+                for (const [dest, nextHops] of Object.entries(destinations)) {
+                    html += `
+                        <tr>
+                            <td><strong>${dest}</strong></td>
+                            <td>
+                    `;
+                    
+                    for (const hop of nextHops) {
+                        html += `
+                            <div class="next-hop">
+                                <div class="hop-address">
+                                    <strong>${hop.target_address}</strong>
+                                </div>
+                                <div class="hop-details">
+                                    <span>VNI: ${hop.target_vni}</span>
+                                    <span>Type: ${hop.hop_type}</span>
+                                    ${hop.hop_type === 'Nat' ? 
+                                        `<span>NAT Port Range: ${hop.nat_port_range_from}-${hop.nat_port_range_to}</span>` : 
+                                        ''}
+                                </div>
+                            </div>
+                        `;
+                    }
+                    
+                    html += `
+                            </td>
+                        </tr>
+                    `;
+                }
+                
+                html += `
+                            </tbody>
+                        </table>
+                    </div>
+                `;
+            }
+            
+            contentElement.innerHTML = html;
+        }
+
+        // Initial load
+        document.addEventListener('DOMContentLoaded', loadRouteData);
+        
+        // Add manual refresh button functionality
+        document.getElementById('refresh-button').addEventListener('click', loadRouteData);
+        
+        // Auto-refresh every 30 seconds
+        setInterval(loadRouteData, 30000);
+    </script>
+</body>
+</html>

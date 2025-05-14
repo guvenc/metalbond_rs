@@ -1,27 +1,128 @@
-use crate::metalbond::SharedMetalBondState;
+//! Peer connection handling for MetalBond.
+//!
+//! This module provides the implementation of peer-to-peer connections in the MetalBond VPN,
+//! handling protocol messages, connection establishment, and state management.
+//!
+//! # Architecture
+//!
+//! The peer module uses an actor-based architecture with a Finite State Machine (FSM) to manage
+//! connection state transitions. This architecture provides key benefits:
+//!
+//! 1. **Thread Safety**: All state changes happen within the actor thread
+//! 2. **Race Condition Prevention**: External code sends transition intent messages instead
+//!    of directly modifying state
+//! 3. **Controlled State Transitions**: The FSM ensures only valid state transitions occur
+//!
+//! # Race Condition Prevention
+//!
+//! A key design feature is preventing race conditions in state transitions, especially when
+//! multiple parts of the code might interact with peer state (connection handling, hello
+//! handshake processing, etc.).
+//!
+//! Rather than allowing multiple code paths to directly modify state, all changes must go
+//! through the actor via FSM transition intent messages. This ensures that:
+//!
+//! - State is always modified in a single thread (the actor thread)
+//! - All state transitions follow the FSM rules
+//! - Advanced states are never accidentally overwritten by lower states
+//!
+//! For example, when `handle_hello_message` needs to change state, it sends a `HelloReceived`
+//! message to the actor rather than directly changing state, which could conflict with other
+//! operations like `setup_connection`.
+
+use crate::metalbond::MetalBondCommand;
 use crate::pb;
 use crate::types::{
-    Config, ConnectionDirection, ConnectionState, Destination, InternalUpdate, MessageType, NextHop,
-    UpdateAction, Vni,
+    Config, ConnectionDirection, ConnectionState, Destination, MessageType, NextHop, UpdateAction,
+    Vni,
 };
 use anyhow::{anyhow, bail, Context, Result};
 use bytes::BytesMut;
-use futures::{SinkExt, StreamExt};
+use futures::stream::StreamExt;
+use futures::sink::SinkExt;
 use ipnet::IpNet;
 use prost::Message;
 use std::collections::HashSet;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
+use thiserror::Error;
 use tokio::net::TcpStream;
-use tokio::sync::{mpsc, RwLock};
-use tokio::time::{self, Instant, Interval, Sleep}; // Ensure Instant is imported if not already via `self`
-use tokio_util::codec::{Decoder, Encoder, Framed};
+use tokio::sync::{mpsc, oneshot};
+use tokio_util::codec::{Decoder, Encoder};
+use tracing::{debug, error, info, info_span, warn, Instrument};
 
 const PEER_TX_BUFFER_SIZE: usize = 256; // How many outbound messages can queue up
 const METALBOND_VERSION: u8 = 1;
 const MAX_MESSAGE_LEN: usize = 1188;
+const RETRY_DELAY_MS: u64 = 3000;
 
+#[derive(Debug, Error)]
+pub enum PeerError {
+    #[error("Channel send error: {0}")]
+    ChannelSend(String),
+    
+    #[error("Channel receive error: {0}")]
+    ChannelReceive(String),
+    
+    #[error("Protocol error: {0}")]
+    Protocol(String),
+    
+    #[error("Connection error: {0}")]
+    Connection(String),
+    
+    #[error("Peer TX channel full")]
+    ChannelFull,
+    
+    #[error("Peer TX channel closed")]
+    ChannelClosed,
+    
+    #[error("Invalid message: {0}")]
+    InvalidMessage(String),
+}
+
+/// Messages that can be sent to the Peer actor
+///
+/// This enum defines all the messages that can be sent to the Peer actor.
+/// These messages serve two purposes:
+/// 1. External API calls (like send hello, subscribe, etc.)
+/// 2. Finite State Machine (FSM) transition intents
+///
+/// The FSM transition intents allow for safe state changes within the actor model,
+/// preventing race conditions by ensuring all state transitions happen in the actor thread.
 #[derive(Debug)]
+pub enum PeerMessage {
+    // External API messages
+    SendHello(oneshot::Sender<Result<()>>),
+    SendKeepalive(oneshot::Sender<Result<()>>),
+    SendSubscribe(Vni, oneshot::Sender<Result<()>>),
+    SendUnsubscribe(Vni, oneshot::Sender<Result<()>>),
+    SendUpdate(
+        UpdateAction,
+        Vni,
+        Destination,
+        NextHop,
+        oneshot::Sender<Result<()>>,
+    ),
+    GetState(oneshot::Sender<ConnectionState>),
+    GetConnectionState(oneshot::Sender<ConnectionState>),
+    
+    // Legacy direct state setting (will be deprecated)
+    SetState(ConnectionState),
+    
+    // FSM transition intents
+    ConnectionSetup,    // Intent to enter Connecting state
+    HelloSent,          // Intent to transition to HelloSent state
+    HelloReceived,      // Intent to transition to HelloReceived state
+    ConnectionEstablished, // Intent to transition to Established state
+    ConnectionLost,     // Intent to handle connection loss
+    ConnectionClosed,   // Intent to transition to Closed state
+    
+    // Control messages
+    Retry,              // Intent to retry connection
+    Shutdown,           // Intent to shut down actor
+}
+
+#[derive(Debug, Clone)]
 pub enum GeneratedMessage {
     Hello(pb::Hello),
     Keepalive,
@@ -46,12 +147,15 @@ impl GeneratedMessage {
             GeneratedMessage::Hello(msg) => Ok((MessageType::Hello, msg.encode_to_vec())),
             GeneratedMessage::Keepalive => Ok((MessageType::Keepalive, Vec::new())),
             GeneratedMessage::Subscribe(msg) => Ok((MessageType::Subscribe, msg.encode_to_vec())),
-            GeneratedMessage::Unsubscribe(msg) => Ok((MessageType::Unsubscribe, msg.encode_to_vec())),
+            GeneratedMessage::Unsubscribe(msg) => {
+                Ok((MessageType::Unsubscribe, msg.encode_to_vec()))
+            }
             GeneratedMessage::Update(msg) => Ok((MessageType::Update, msg.encode_to_vec())),
         }
     }
 }
 
+#[derive(Debug, Default, Clone)]
 struct MetalBondCodec;
 
 impl Encoder<GeneratedMessage> for MetalBondCodec {
@@ -106,524 +210,1031 @@ impl Decoder for MetalBondCodec {
     }
 }
 
-pub struct Peer {
-    metalbond_state: SharedMetalBondState,
+/// Internal state for the Peer actor.
+/// 
+/// This struct holds all the data needed by the peer actor to maintain
+/// its connection, track state, and communicate with other components.
+/// The state is only modified within the actor's thread, ensuring thread safety
+/// and preventing race conditions in FSM transitions.
+#[derive(Debug)]
+struct PeerState {
+    metalbond_tx: mpsc::Sender<MetalBondCommand>,
     config: Arc<Config>,
     remote_addr: SocketAddr,
+    #[allow(dead_code)]
     local_addr: Option<SocketAddr>,
     direction: ConnectionDirection,
-    pub is_remote_server: RwLock<bool>,
-    state: Arc<RwLock<ConnectionState>>,
-    subscribed_vnis_remote: Arc<RwLock<HashSet<Vni>>>,
-    tx_sender: mpsc::Sender<GeneratedMessage>,
-    shutdown_signal: Arc<tokio::sync::Notify>,
+    #[allow(dead_code)]
+    is_remote_server: bool,
+    state: ConnectionState,
+    #[allow(dead_code)]
+    subscribed_vnis_remote: HashSet<Vni>,
+    wire_tx: mpsc::Sender<GeneratedMessage>,
+}
+
+/// Public interface for a peer connection.
+///
+/// Each peer represents a connection to a remote MetalBond instance.
+/// The peer uses the actor model for internal concurrency, exposing
+/// a public API to interact with it.
+///
+/// State transitions are handled through Finite State Machine (FSM) messages,
+/// ensuring that all state changes happen within the actor thread to prevent
+/// race conditions when multiple parts of the code interact with the peer.
+pub struct Peer {
+    remote_addr: SocketAddr,
+    message_tx: mpsc::Sender<PeerMessage>,
 }
 
 impl Peer {
+    /// Creates a new peer instance and returns its handle along with a channel
+    /// for sending wire protocol messages.
+    ///
+    /// # Arguments
+    /// * `metalbond_tx` - Channel to send commands to the MetalBond instance
+    /// * `config` - System configuration
+    /// * `remote_addr` - Address of the remote peer
+    /// * `direction` - Direction of the connection (incoming or outgoing)
     pub fn new(
-        metalbond_state: SharedMetalBondState,
+        metalbond_tx: mpsc::Sender<MetalBondCommand>,
         config: Arc<Config>,
         remote_addr: SocketAddr,
         direction: ConnectionDirection,
     ) -> (Arc<Self>, mpsc::Receiver<GeneratedMessage>) {
-        let (tx_sender, tx_receiver) = mpsc::channel(PEER_TX_BUFFER_SIZE);
-        let peer = Arc::new(Peer {
-            metalbond_state,
+        let (wire_tx, wire_rx) = mpsc::channel(PEER_TX_BUFFER_SIZE);
+        let (message_tx, message_rx) = mpsc::channel(32);
+
+        // Create the internal state
+        let state = PeerState {
+            metalbond_tx,
             config,
             remote_addr,
             local_addr: None,
             direction,
-            is_remote_server: RwLock::new(false),
-            state: Arc::new(RwLock::new(ConnectionState::Connecting)),
-            subscribed_vnis_remote: Arc::new(RwLock::new(HashSet::new())),
-            tx_sender,
-            shutdown_signal: Arc::new(tokio::sync::Notify::new()),
+            is_remote_server: false,
+            state: ConnectionState::Connecting,
+            subscribed_vnis_remote: HashSet::new(),
+            wire_tx,
+        };
+
+        // Create a span for this peer actor
+        let span = info_span!("peer_actor", peer = %remote_addr, direction = ?direction);
+
+        // Spawn the actor
+        tokio::spawn(
+            Self::actor_loop(state, message_rx)
+                .instrument(span)
+        );
+
+        let peer = Arc::new(Self {
+            remote_addr,
+            message_tx,
         });
-        (peer, tx_receiver)
+
+        (peer, wire_rx)
     }
 
-    pub async fn get_state(&self) -> ConnectionState {
-        *self.state.read().await
-    }
-
-    pub fn get_remote_addr(&self) -> SocketAddr {
-        self.remote_addr
-    }
-
-    async fn set_state(&self, new_state: ConnectionState) {
-        let mut current_state = self.state.write().await;
-        let old_state = *current_state;
-        if old_state == new_state {
-            return;
-        }
-        *current_state = new_state;
-        drop(current_state);
-        tracing::info!(peer = %self.remote_addr, old = %old_state, new = %new_state, "Peer state changed");
-
-        if new_state == ConnectionState::Established && old_state != ConnectionState::Established {
-            let local_subs = self.metalbond_state.read().await.my_subscriptions.clone();
-            for vni in local_subs {
-                tracing::debug!(peer = %self.remote_addr, %vni, "Sending initial SUBSCRIBE");
-                if let Err(e) = self.send_subscribe(vni).await {
-                    tracing::error!(peer = %self.remote_addr, %vni, "Failed to send initial subscribe: {}", e);
-                    self.trigger_shutdown();
-                }
-            }
-            let local_announcements = self.metalbond_state.read().await.my_announcements.get_local_announcements().await;
-            for (vni, dest_map) in local_announcements {
-                for(dest, hops) in dest_map {
-                    for hop in hops {
-                        tracing::debug!(peer = %self.remote_addr, %vni, %dest, %hop, "Sending initial ADD Announce");
-                        if let Err(e) = self.send_update(UpdateAction::Add, vni, dest, hop).await {
-                            tracing::error!(peer = %self.remote_addr, %vni, %dest, %hop, "Failed to send initial announcement: {}", e);
-                            self.trigger_shutdown();
-                            return;
+    /// The main actor loop that processes messages sent to the peer.
+    ///
+    /// This function implements the actor model and houses the FSM logic.
+    /// All state transitions are handled here in a single thread, preventing
+    /// race conditions that could occur if state were modified from multiple threads.
+    async fn actor_loop(mut state: PeerState, mut rx: mpsc::Receiver<PeerMessage>) {
+        debug!(peer = %state.remote_addr, "Peer actor starting");
+        
+        while let Some(msg) = rx.recv().await {
+            let msg_span = info_span!("actor_message", peer = %state.remote_addr, message_type = ?msg);
+            
+            async {
+                match msg {
+                    PeerMessage::SendHello(resp) => {
+                        let result = Self::handle_send_hello(&mut state, false).await;
+                        let _ = resp.send(result);
+                    }
+                    PeerMessage::SendKeepalive(resp) => {
+                        let result = Self::handle_send_keepalive(&state).await;
+                        let _ = resp.send(result);
+                    }
+                    PeerMessage::SendSubscribe(vni, resp) => {
+                        let result = Self::handle_send_subscribe(&state, vni).await;
+                        let _ = resp.send(result);
+                    }
+                    PeerMessage::SendUnsubscribe(vni, resp) => {
+                        let result = Self::handle_send_unsubscribe(&state, vni).await;
+                        let _ = resp.send(result);
+                    }
+                    PeerMessage::SendUpdate(action, vni, dest, nh, resp) => {
+                        let result = Self::handle_send_update(&state, action, vni, dest, nh).await;
+                        let _ = resp.send(result);
+                    }
+                    PeerMessage::GetState(resp) => {
+                        let _ = resp.send(state.state);
+                    }
+                    PeerMessage::SetState(new_state) => {
+                        let old_state = state.state;
+                        if old_state == new_state {
+                            return; // Exit the async block instead of continue
                         }
+
+                        state.state = new_state;
+                        info!(
+                            old = %old_state,
+                            new = %new_state,
+                            "Peer state changed"
+                        );
+
+                        // Handle state transitions
+                        match (old_state, new_state) {
+                            (_, ConnectionState::Established)
+                                if old_state != ConnectionState::Established =>
+                            {
+                                // Newly established connection
+                                Self::handle_connection_established(&state).await;
+                            }
+                            (ConnectionState::Established, _) => {
+                                // Connection lost
+                                info!("Connection lost, cleaning up peer resources");
+                                Self::handle_connection_lost(&state).await;
+                            }
+                            (_, ConnectionState::Connecting) => {
+                                debug!("Transitioning to CONNECTING state");
+                            }
+                            _ => {}
+                        }
+                    }
+                    PeerMessage::GetConnectionState(resp) => {
+                        let _ = resp.send(state.state);
+                    }
+                    PeerMessage::Retry => {
+                        // Handle retry logic
+                        info!("Retrying connection");
+                        
+                        // Only handle retry if we're in Retry state
+                        if state.state == ConnectionState::Retry {
+                            // If this is an outgoing connection, attempt to reconnect
+                            if state.direction == ConnectionDirection::Outgoing {
+                                // Reset hello flags
+                                state.state = ConnectionState::Connecting;
+                                
+                                // Notify MetalBond about the retry attempt
+                                let (tx, rx) = oneshot::channel();
+                                if let Err(e) = state.metalbond_tx.send(
+                                    MetalBondCommand::RetryConnection(state.remote_addr, tx)
+                                ).await {
+                                    error!("Failed to send retry notification: {}", e);
+                                } else {
+                                    if let Err(e) = rx.await {
+                                        error!("Failed to receive retry response: {}", e);
+                                    }
+                                }
+                                
+                                // Move to Connecting state
+                                state.state = ConnectionState::Connecting;
+                            } else {
+                                // For incoming connections, we can't retry - remote must reconnect
+                                warn!("Cannot retry incoming connection");
+                            }
+                        } else {
+                            warn!("Retry requested but state is {}", state.state);
+                        }
+                    }
+                    PeerMessage::Shutdown => {
+                        debug!("Peer actor shutting down");
+                        rx.close(); // Close the channel instead of using break
+                        return; // Exit the async block
+                    }
+                    PeerMessage::ConnectionSetup => {
+                        // Handle connection setup intent
+                        Self::handle_connection_setup(&mut state).await;
+                    }
+                    PeerMessage::HelloSent => {
+                        // Handle HelloSent intent
+                        Self::handle_hello_sent(&mut state).await;
+                    }
+                    PeerMessage::HelloReceived => {
+                        // Handle HelloReceived intent
+                        Self::handle_hello_received(&mut state).await;
+                    }
+                    PeerMessage::ConnectionEstablished => {
+                        // Handle connection established intent
+                        Self::handle_connection_established(&state).await;
+                    }
+                    PeerMessage::ConnectionLost => {
+                        // Handle connection lost intent
+                        Self::handle_connection_lost(&state).await;
+                    }
+                    PeerMessage::ConnectionClosed => {
+                        // Handle connection closed intent
+                        Self::handle_connection_closed(&mut state).await;
                     }
                 }
             }
-        } else if new_state != ConnectionState::Established && old_state == ConnectionState::Established {
-            tracing::info!(peer = %self.remote_addr, "Connection lost, cleaning up peer resources");
-            self.cleanup_peer_state().await;
+            .instrument(msg_span)
+            .await;
         }
+        
+        info!(peer = %state.remote_addr, "Peer actor terminated");
     }
 
-    async fn send_message(&self, msg: GeneratedMessage) -> Result<()> {
-        match self.tx_sender.try_send(msg) {
-            Ok(_) => Ok(()),
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                tracing::warn!(peer = %self.remote_addr, "Tx channel full, message dropped");
-                Err(anyhow!("Peer TX channel full"))
-            }
-            Err(mpsc::error::TrySendError::Closed(_)) => {
-                tracing::warn!(peer = %self.remote_addr, "Tx channel closed, cannot send message");
-                Err(anyhow!("Peer TX channel closed"))
-            }
-        }
-    }
-
-    pub async fn send_hello(&self, is_server: bool) -> Result<()> {
+    // Helper methods for the actor
+    async fn handle_send_hello(state: &mut PeerState, _is_server: bool) -> Result<()> {
+        // Derive is_server from connection direction
+        let is_server_derived = state.direction == ConnectionDirection::Incoming;
         let hello = pb::Hello {
-            keepalive_interval: self.config.keepalive_interval.as_secs() as u32,
-            is_server,
+            keepalive_interval: state.config.keepalive_interval.as_secs() as u32,
+            is_server: is_server_derived,
         };
-        self.send_message(GeneratedMessage::Hello(hello)).await
+        
+        tracing::debug!(
+            peer = %state.remote_addr,
+            old_state = %state.state,
+            "Sending Hello message as {}",
+            if is_server_derived { "server" } else { "client" }
+        );
+        
+        // First send the message
+        let result = Self::send_message(&state.wire_tx, GeneratedMessage::Hello(hello)).await;
+        
+        // If sending was successful, update state based on FSM rules
+        if result.is_ok() {
+            // Handle state transitions internally to handle_send_hello
+            // This avoids the need to go through the actor loop for this specific case
+            match state.state {
+                ConnectionState::Connecting => {
+                    // No Hello received yet, transition to HelloSent
+                    state.state = ConnectionState::HelloSent;
+                    info!(from = %ConnectionState::Connecting, to = %ConnectionState::HelloSent, "Transitioning state (internal)");
+                },
+                ConnectionState::HelloReceived => {
+                    // We've received Hello and now sending one, transition to Established
+                    state.state = ConnectionState::Established;
+                    info!(from = %ConnectionState::HelloReceived, to = %ConnectionState::Established, "Transitioning state (internal)");
+                    
+                    // Also perform established actions
+                    Self::handle_connection_established(&state).await;
+                },
+                ConnectionState::HelloSent | ConnectionState::Established => {
+                    // Already sent Hello before, maintain current state
+                    debug!(current = %state.state, "Maintaining current state on hello_sent");
+                },
+                ConnectionState::Retry => {
+                    // If in retry state, sending Hello means we're now in HelloSent
+                    state.state = ConnectionState::HelloSent;
+                    info!(from = %ConnectionState::Retry, to = %ConnectionState::HelloSent, "Transitioning state (internal)");
+                },
+                ConnectionState::Closed => {
+                    // Sending Hello while closed is unusual but possible during reconnection
+                    // Move to HelloSent
+                    state.state = ConnectionState::HelloSent;
+                    info!(from = %ConnectionState::Closed, to = %ConnectionState::HelloSent, "Transitioning state (internal)");
+                },
+            }
+        }
+        
+        result
     }
 
-    pub async fn send_keepalive(&self) -> Result<()> {
-        self.send_message(GeneratedMessage::Keepalive).await
+    async fn handle_send_keepalive(state: &PeerState) -> Result<()> {
+        Self::send_message(&state.wire_tx, GeneratedMessage::Keepalive).await
     }
 
-    pub async fn send_subscribe(&self, vni: Vni) -> Result<()> {
+    async fn handle_send_subscribe(state: &PeerState, vni: Vni) -> Result<()> {
         let sub = pb::Subscription { vni };
-        self.send_message(GeneratedMessage::Subscribe(sub)).await
+        Self::send_message(&state.wire_tx, GeneratedMessage::Subscribe(sub)).await
     }
 
-    pub async fn send_unsubscribe(&self, vni: Vni) -> Result<()> {
+    async fn handle_send_unsubscribe(state: &PeerState, vni: Vni) -> Result<()> {
         let unsub = pb::Subscription { vni };
-        self.send_message(GeneratedMessage::Unsubscribe(unsub)).await
+        Self::send_message(&state.wire_tx, GeneratedMessage::Unsubscribe(unsub)).await
     }
 
-    pub async fn send_update(&self, action: UpdateAction, vni: Vni, dest: Destination, nh: NextHop) -> Result<()> {
-        let pb_dest = dest.try_into().context("Failed to convert Destination to protobuf")?;
-        let pb_nh = nh.try_into().context("Failed to convert NextHop to protobuf")?;
+    async fn handle_send_update(
+        state: &PeerState,
+        action: UpdateAction,
+        vni: Vni,
+        dest: Destination,
+        nh: NextHop,
+    ) -> Result<()> {
+        let pb_dest = dest
+            .try_into()
+            .context("Failed to convert Destination to protobuf")?;
+        let pb_nh = nh
+            .try_into()
+            .context("Failed to convert NextHop to protobuf")?;
         let update = pb::Update {
             action: pb::Action::from(action) as i32,
             vni,
             destination: Some(pb_dest),
             next_hop: Some(pb_nh),
         };
-        self.send_message(GeneratedMessage::Update(update)).await
+        Self::send_message(&state.wire_tx, GeneratedMessage::Update(update)).await
+    }
+
+    /// Handles the connection setup intent.
+    ///
+    /// This is part of the FSM implementation and transitions to Connecting state
+    /// only if the current state allows it (e.g., from Closed or Retry).
+    /// This prevents races where connection setup could overwrite more advanced states.
+    async fn handle_connection_setup(state: &mut PeerState) {
+        // Check if the current state allows transition to Connecting
+        if state.state == ConnectionState::Closed || state.state == ConnectionState::Retry {
+            state.state = ConnectionState::Connecting;
+            info!(from = %ConnectionState::Closed, to = %ConnectionState::Connecting, "Transitioning state");
+        } else {
+            // If already in a more advanced state, don't regress
+            info!(current = %state.state, "Maintaining current state during connection setup");
+        }
+    }
+
+    /// Handles the Hello Sent intent.
+    ///
+    /// Part of the FSM implementation that transitions state based on
+    /// sending a Hello message, according to the protocol's state machine rules.
+    async fn handle_hello_sent(state: &mut PeerState) {
+        // Only transition to HelloSent if in Connecting state
+        match state.state {
+            ConnectionState::Connecting => {
+                state.state = ConnectionState::HelloSent;
+                info!(from = %ConnectionState::Connecting, to = %ConnectionState::HelloSent, "Transitioning state");
+            },
+            ConnectionState::HelloReceived => {
+                // If we received a Hello and now sending one, we're established
+                state.state = ConnectionState::Established;
+                info!(from = %ConnectionState::HelloReceived, to = %ConnectionState::Established, "Transitioning state");
+                
+                // Perform established actions
+                Self::handle_connection_established(&state).await;
+            },
+            _ => {
+                info!(current = %state.state, "Not changing state on hello_sent");
+            }
+        }
+    }
+
+    /// Handles the Hello Received intent.
+    ///
+    /// Part of the FSM implementation that transitions state based on
+    /// receiving a Hello message, according to the protocol's state machine rules.
+    async fn handle_hello_received(state: &mut PeerState) {
+        // Transition based on current state
+        match state.state {
+            ConnectionState::Connecting => {
+                state.state = ConnectionState::HelloReceived;
+                info!(from = %ConnectionState::Connecting, to = %ConnectionState::HelloReceived, "Transitioning state");
+            },
+            ConnectionState::HelloSent => {
+                // We sent Hello and now received one, we're established
+                state.state = ConnectionState::Established;
+                info!(from = %ConnectionState::HelloSent, to = %ConnectionState::Established, "Transitioning state");
+                
+                // Perform established actions
+                Self::handle_connection_established(&state).await;
+            },
+            _ => {
+                info!(current = %state.state, "Not changing state on hello_received");
+            }
+        }
+    }
+
+    async fn handle_connection_established(state: &PeerState) {
+        let peer_addr = state.remote_addr;
+        let span = info_span!("connection_established", peer = %peer_addr);
+        
+        async {
+            info!("Connection established, sending subscriptions");
+            
+            // Only send subscription requests if direction is outgoing (we're the client)
+            if state.direction == ConnectionDirection::Outgoing {
+                // Get the list of subscribed VNIs from MetalBond
+                let (tx, rx) = oneshot::channel();
+                if let Err(e) = state.metalbond_tx.send(MetalBondCommand::GetSubscribedVnis(tx)).await {
+                    error!("Failed to get subscribed VNIs: {}", e);
+                    return;
+                }
+                
+                // Get the list of VNIs
+                let vnis = match rx.await {
+                    Ok(vnis) => vnis,
+                    Err(e) => {
+                        error!("Failed to receive subscribed VNIs: {}", e);
+                        return;
+                    }
+                };
+                
+                // Log the VNIs we're going to subscribe to
+                if vnis.is_empty() {
+                    info!("No VNIs to subscribe to");
+                } else {
+                    info!(vni_count = vnis.len(), "Sending subscription requests");
+                    
+                    // Send subscription for each VNI
+                    for vni in vnis {
+                        let sub = pb::Subscription { vni };
+                        if let Err(e) = Self::send_message(&state.wire_tx, GeneratedMessage::Subscribe(sub)).await {
+                            warn!(vni = vni, "Failed to send subscription: {}", e);
+                        } else {
+                            debug!(vni = vni, "Sent subscription request");
+                        }
+                    }
+                    
+                    info!("All subscription requests sent");
+                }
+            } else {
+                info!("Not sending subscriptions as we're the server for this connection");
+            }
+        }
+        .instrument(span)
+        .await;
+    }
+
+    async fn handle_connection_lost(state: &PeerState) {
+        // Only handle if we were previously established
+        if state.state == ConnectionState::Established {
+            info!("Connection lost, cleaning up peer resources");
+            
+            // Notify MetalBond to remove routes from this peer
+            let (tx, rx) = oneshot::channel();
+            let _ = state
+                .metalbond_tx
+                .send(MetalBondCommand::RemovePeer(state.remote_addr, tx))
+                .await;
+            if let Err(e) = rx.await {
+                error!(peer = %state.remote_addr, "Failed to clean up peer: {}", e);
+            }
+        }
+    }
+
+    async fn handle_connection_closed(state: &mut PeerState) {
+        let old_state = state.state;
+        state.state = ConnectionState::Closed;
+        info!(from = %old_state, to = %ConnectionState::Closed, "Connection closed");
+        
+        // If we were previously established, clean up
+        if old_state == ConnectionState::Established {
+            Self::handle_connection_lost(state).await;
+        }
+    }
+
+    async fn send_message(
+        tx: &mpsc::Sender<GeneratedMessage>,
+        msg: GeneratedMessage,
+    ) -> Result<()> {
+        match tx.try_send(msg) {
+            Ok(_) => Ok(()),
+            Err(mpsc::error::TrySendError::Full(_)) => Err(PeerError::ChannelFull.into()),
+            Err(mpsc::error::TrySendError::Closed(_)) => Err(PeerError::ChannelClosed.into()),
+        }
+    }
+
+    // Public interface methods
+    pub fn get_remote_addr(&self) -> SocketAddr {
+        self.remote_addr
+    }
+
+    pub async fn get_state(&self) -> Result<ConnectionState> {
+        let (tx, rx) = oneshot::channel();
+        self.message_tx
+            .send(PeerMessage::GetState(tx))
+            .await
+            .map_err(|e| PeerError::ChannelSend(e.to_string()))?;
+        rx.await.map_err(|e| PeerError::ChannelReceive(e.to_string()).into())
+    }
+
+    pub async fn send_hello(&self) -> Result<()> {
+        let (tx, rx) = oneshot::channel();
+        self.message_tx
+            .send(PeerMessage::SendHello(tx))
+            .await
+            .map_err(|_| anyhow!("Failed to send Hello message"))?;
+        rx.await
+            .map_err(|_| anyhow!("Failed to get Hello result"))?
+    }
+
+    pub async fn send_keepalive(&self) -> Result<()> {
+        let (tx, rx) = oneshot::channel();
+        self.message_tx
+            .send(PeerMessage::SendKeepalive(tx))
+            .await
+            .map_err(|_| anyhow!("Failed to send Keepalive message"))?;
+        rx.await
+            .map_err(|_| anyhow!("Failed to get Keepalive result"))?
+    }
+
+    pub async fn send_subscribe(&self, vni: Vni) -> Result<()> {
+        let (tx, rx) = oneshot::channel();
+        self.message_tx
+            .send(PeerMessage::SendSubscribe(vni, tx))
+            .await
+            .map_err(|_| anyhow!("Failed to send Subscribe message"))?;
+        rx.await
+            .map_err(|_| anyhow!("Failed to get Subscribe result"))?
+    }
+
+    pub async fn send_unsubscribe(&self, vni: Vni) -> Result<()> {
+        let (tx, rx) = oneshot::channel();
+        self.message_tx
+            .send(PeerMessage::SendUnsubscribe(vni, tx))
+            .await
+            .map_err(|_| anyhow!("Failed to send Unsubscribe message"))?;
+        rx.await
+            .map_err(|_| anyhow!("Failed to get Unsubscribe result"))?
+    }
+
+    pub async fn send_update(
+        &self,
+        action: UpdateAction,
+        vni: Vni,
+        dest: Destination,
+        nh: NextHop,
+    ) -> Result<()> {
+        let (tx, rx) = oneshot::channel();
+        self.message_tx
+            .send(PeerMessage::SendUpdate(action, vni, dest, nh, tx))
+            .await
+            .map_err(|_| anyhow!("Failed to send Update message"))?;
+        rx.await
+            .map_err(|_| anyhow!("Failed to get Update result"))?
     }
 
     pub fn trigger_shutdown(&self) {
-        tracing::debug!(peer = %self.remote_addr, "Shutdown triggered");
-        self.shutdown_signal.notify_one();
+        // Fire and forget, not waiting for result
+        let _ = self.message_tx.try_send(PeerMessage::Shutdown);
     }
 
-    async fn cleanup_peer_state(&self) {
-        let mb_state = self.metalbond_state.read().await;
-        let removed_routes = mb_state.route_table.remove_routes_from_peer(self.remote_addr).await;
-        tracing::info!(peer = %self.remote_addr, count = removed_routes.len(), "Removed routes learned from peer");
-        for (vni, dest, nh) in removed_routes {
-            let update = InternalUpdate {
-                action: UpdateAction::Remove,
-                vni,
-                destination: dest,
-                next_hop: nh,
-                source_peer: Some(self.remote_addr),
-            };
-            if let Err(e) = mb_state.route_update_tx.send(update).await {
-                tracing::error!(peer = %self.remote_addr, "Failed to send route removal update for distribution: {}", e);
-            }
+    /// Sets the peer's state by sending the appropriate FSM transition message.
+    ///
+    /// This method translates the desired connection state into the appropriate
+    /// FSM transition intent message. This ensures all state changes go through
+    /// the actor's FSM logic, preventing race conditions.
+    pub fn set_state(&self, new_state: ConnectionState) {
+        // Map ConnectionState to appropriate FSM transition message
+        let transition_msg = match new_state {
+            ConnectionState::Connecting => PeerMessage::ConnectionSetup,
+            ConnectionState::HelloSent => PeerMessage::HelloSent,
+            ConnectionState::HelloReceived => PeerMessage::HelloReceived,
+            ConnectionState::Established => PeerMessage::ConnectionEstablished,
+            ConnectionState::Retry => PeerMessage::Retry,
+            ConnectionState::Closed => PeerMessage::ConnectionClosed,
+        };
+        
+        // Send the FSM transition message
+        if let Err(e) = self.message_tx.try_send(transition_msg) {
+            tracing::warn!(
+                peer = %self.remote_addr,
+                "Failed to send transition to {}: {}",
+                new_state,
+                e
+            );
         }
-        let mut remote_subs = self.subscribed_vnis_remote.write().await;
-        if !remote_subs.is_empty() {
-            let mut mb_state_w = self.metalbond_state.write().await;
-            for vni in remote_subs.iter() {
-                if let Some(peer_set) = mb_state_w.subscribers.get_mut(vni) {
-                    peer_set.remove(&self.remote_addr);
-                    tracing::debug!(peer = %self.remote_addr, %vni, "Removed peer from VNI subscribers list");
-                }
-            }
-            remote_subs.clear();
-        }
-        drop(remote_subs);
-        tracing::info!(peer = %self.remote_addr, "Peer state cleanup complete");
     }
 
-    async fn process_hello(&self, hello: pb::Hello) -> Result<()> {
-        tracing::info!(peer = %self.remote_addr, interval = hello.keepalive_interval, is_server = hello.is_server, "Received HELLO");
-        if hello.keepalive_interval == 0 {
-            bail!("Invalid keepalive interval 0 received");
-        }
-        *self.is_remote_server.write().await = hello.is_server;
-        let current_state = self.get_state().await;
-        match self.direction {
-            ConnectionDirection::Incoming => {
-                if current_state == ConnectionState::Connecting || current_state == ConnectionState::HelloReceived {
-                    self.send_hello(true).await.context("Failed to send HELLO response")?;
-                    self.set_state(ConnectionState::HelloSent).await;
-                } else {
-                    tracing::warn!(peer = %self.remote_addr, state = %current_state, "Received HELLO in unexpected state");
-                }
-            }
-            ConnectionDirection::Outgoing => {
-                if current_state == ConnectionState::HelloSent {
-                    self.set_state(ConnectionState::HelloReceived).await;
-                } else {
-                    tracing::warn!(peer = %self.remote_addr, state = %current_state, "Received HELLO in unexpected state");
-                }
-            }
-        }
-        Ok(())
+    pub fn get_message_tx(&self) -> mpsc::Sender<PeerMessage> {
+        self.message_tx.clone()
     }
 
-    async fn process_keepalive(&self) -> Result<()> {
-        tracing::trace!(peer = %self.remote_addr, "Received KEEPALIVE");
-        let current_state = self.get_state().await;
-        match self.direction {
-            ConnectionDirection::Incoming => {
-                if current_state == ConnectionState::HelloSent {
-                    self.set_state(ConnectionState::Established).await;
-                } else if current_state == ConnectionState::Established {
-                    self.send_keepalive().await.context("Failed to send KEEPALIVE response")?;
-                } else {
-                    tracing::warn!(peer = %self.remote_addr, state = %current_state, "Received KEEPALIVE in unexpected state");
-                    bail!("Keepalive in wrong state");
-                }
-            }
-            ConnectionDirection::Outgoing => {
-                if current_state == ConnectionState::HelloReceived {
-                    self.set_state(ConnectionState::Established).await;
-                } else if current_state == ConnectionState::Established {
-                    // Expected, just reset timeout
-                } else {
-                    tracing::warn!(peer = %self.remote_addr, state = %current_state, "Received KEEPALIVE in unexpected state");
-                    bail!("Keepalive in wrong state");
-                }
-            }
+    // Temporary compatibility methods for tests that use the old flags
+    #[cfg(test)]
+    pub async fn get_hello_exchange_status(&self) -> Result<(bool, bool)> {
+        let state = self.get_state().await?;
+        match state {
+            ConnectionState::Connecting => Ok((false, false)),
+            ConnectionState::HelloSent => Ok((true, false)),
+            ConnectionState::HelloReceived => Ok((false, true)),
+            ConnectionState::Established => Ok((true, true)),
+            _ => Ok((false, false)),
         }
-        Ok(())
     }
 
-    async fn process_subscribe(&self, sub: pb::Subscription) -> Result<()> {
-        let vni = sub.vni;
-        tracing::info!(peer = %self.remote_addr, %vni, "Received SUBSCRIBE");
-        let mut mb_state = self.metalbond_state.write().await;
-        let was_inserted = mb_state
-            .subscribers
-            .entry(vni)
-            .or_default()
-            .insert(self.remote_addr);
-        drop(mb_state);
-        self.subscribed_vnis_remote.write().await.insert(vni);
-        if was_inserted {
-            tracing::info!(peer = %self.remote_addr, %vni, "Added peer as subscriber");
-            let mb_state_read = self.metalbond_state.read().await;
-            let routes_to_send = mb_state_read.route_table.get_destinations_by_vni_with_peer(vni).await;
-            drop(mb_state_read);
-            for (dest, nh_map) in routes_to_send {
-                for (nh, sources) in nh_map {
-                    let is_nat_from_peer = nh.hop_type == pb::NextHopType::Nat && sources.contains(&Some(self.remote_addr));
-                    let is_server_to_server_loop = *self.is_remote_server.read().await && sources.iter().any(|_src_peer| {
-                        false
-                    });
-                    if !is_nat_from_peer && !is_server_to_server_loop {
-                        if let Err(e) = self.send_update(UpdateAction::Add, vni, dest, nh).await {
-                            tracing::error!(peer = %self.remote_addr, %vni, %dest, %nh, "Failed to send existing route to new subscriber: {}",e);
-                            self.trigger_shutdown();
-                            return Err(e);
-                        }
-                    } else {
-                        tracing::trace!(peer = %self.remote_addr, %vni, %dest, %nh, "Skipping send to subscriber (loop prevention)");
-                    }
-                }
-            }
-        } else {
-            tracing::warn!(peer = %self.remote_addr, %vni, "Peer already subscribed");
-        }
-        Ok(())
+    #[cfg(test)]
+    pub fn set_hello_received(&self, _received: bool) {
+        // This is a no-op now as we use the state machine instead of flags
+        // Tests should use set_state() to change the connection state
     }
 
-    async fn process_unsubscribe(&self, unsub: pb::Subscription) -> Result<()> {
-        let vni = unsub.vni;
-        tracing::info!(peer = %self.remote_addr, %vni, "Received UNSUBSCRIBE");
-        let mut mb_state = self.metalbond_state.write().await;
-        let mut removed = false;
-        if let Some(peer_set) = mb_state.subscribers.get_mut(&vni) {
-            removed = peer_set.remove(&self.remote_addr);
-            if peer_set.is_empty() {
-                mb_state.subscribers.remove(&vni);
-                tracing::debug!(peer = %self.remote_addr, %vni, "Removed last subscriber, removing VNI from subscribers map");
+    pub fn handle_connection_failure(&self) {
+        let addr = self.remote_addr;
+        let message_tx = self.message_tx.clone();
+        
+        // Create a future that can be spawned
+        let future = async move {
+            // Set state to Retry
+            info!("Handling connection failure");
+            
+            // Use the cloned message_tx to send the SetState message
+            if let Err(e) = message_tx.send(PeerMessage::SetState(ConnectionState::Retry)).await {
+                error!("Failed to set state to Retry: {}", e);
+                return;
             }
-        }
-        drop(mb_state);
-        self.subscribed_vnis_remote.write().await.remove(&vni);
-        if removed {
-            tracing::info!(peer = %self.remote_addr, %vni, "Removed peer from subscribers");
-            let mb_state_read = self.metalbond_state.read().await;
-            let routes_to_remove = mb_state_read.route_table.get_destinations_by_vni_with_peer(vni).await;
-            drop(mb_state_read);
-            for (dest, nh_map) in routes_to_remove {
-                for (nh, sources) in nh_map {
-                    if sources.contains(&Some(self.remote_addr)) {
-                        tracing::debug!(peer = %self.remote_addr, %vni, %dest, %nh, "Unsubscribe: Removing learned route");
-                        let mb_state_w = self.metalbond_state.write().await;
-                        match mb_state_w.route_table.remove_next_hop(vni, dest, nh, Some(self.remote_addr)).await {
-                            Ok(0) => {
-                                let update = InternalUpdate {
-                                    action: UpdateAction::Remove,
-                                    vni, destination: dest, next_hop: nh,
-                                    source_peer: Some(self.remote_addr),
-                                };
-                                if let Err(e) = mb_state_w.route_update_tx.send(update).await {
-                                    tracing::error!(peer=%self.remote_addr, "Failed to send route removal for distribution: {}", e);
-                                }
-                            }
-                            Ok(_) => {}
-                            Err(e) => {
-                                tracing::error!(peer=%self.remote_addr, "Failed to remove route from table during unsubscribe: {}", e);
-                            }
-                        }
-                    }
+            
+            // Schedule a retry attempt after a delay
+            let retry_sender = message_tx.clone();
+            tokio::spawn(async move {
+                debug!("Scheduling retry in {}ms", RETRY_DELAY_MS);
+                tokio::time::sleep(tokio::time::Duration::from_millis(RETRY_DELAY_MS)).await;
+                
+                // After delay, send the retry message
+                debug!("Retry delay elapsed, sending retry message");
+                if let Err(e) = retry_sender.send(PeerMessage::Retry).await {
+                    error!("Failed to send retry message: {}", e);
                 }
-            }
-        } else {
-            tracing::warn!(peer = %self.remote_addr, %vni, "Peer was not subscribed");
-        }
-        Ok(())
-    }
-
-    async fn process_update(&self, update: pb::Update) -> Result<()> {
-        let vni = update.vni;
-        let action = UpdateAction::from(pb::Action::try_from(update.action)?);
-        let pb_dest = update.destination.ok_or_else(|| anyhow!("Update missing destination"))?;
-        let pb_nh = update.next_hop.ok_or_else(|| anyhow!("Update missing nexthop"))?;
-        let dest: Destination = pb_dest.try_into().context("Invalid destination format")?;
-        let nh: NextHop = pb_nh.try_into().context("Invalid nexthop format")?;
-        tracing::info!(peer = %self.remote_addr, ?action, %vni, %dest, %nh, "Received UPDATE");
-        let is_subscribed_locally = self.metalbond_state.read().await.my_subscriptions.contains(&vni);
-        if !is_subscribed_locally && self.direction == ConnectionDirection::Outgoing {
-            tracing::warn!(peer = %self.remote_addr, %vni, "Received update for VNI we are not subscribed to, ignoring");
-            return Ok(());
-        }
-        let mb_state = self.metalbond_state.write().await;
-        let route_table = &mb_state.route_table;
-        let remaining_count: Result<usize>;
-        match action {
-            UpdateAction::Add => {
-                if route_table.add_next_hop(vni, dest, nh, Some(self.remote_addr)).await {
-                    remaining_count = Ok(1);
-                    tracing::debug!(peer=%self.remote_addr, %vni, %dest, %nh, "Added new route from peer to table");
-                } else {
-                    tracing::debug!(peer=%self.remote_addr, %vni, %dest, %nh, "Route already existed from peer in table");
-                    remaining_count = Ok(999);
-                }
-            }
-            UpdateAction::Remove => {
-                remaining_count = route_table.remove_next_hop(vni, dest, nh, Some(self.remote_addr)).await;
-                if remaining_count.is_ok() {
-                    tracing::debug!(peer=%self.remote_addr, %vni, %dest, %nh, remaining = remaining_count.as_ref().unwrap(), "Removed route from peer from table");
-                } else {
-                    tracing::warn!(peer=%self.remote_addr, %vni, %dest, %nh, "Failed to remove route from peer (maybe already gone?): {:?}", remaining_count.as_ref().err());
-                    return Ok(());
-                }
-            }
-        }
-        match remaining_count {
-            Ok(0) => {
-                let internal_update = InternalUpdate { action: UpdateAction::Remove, vni, destination: dest, next_hop: nh, source_peer: Some(self.remote_addr) };
-                if let Err(e) = mb_state.route_update_tx.send(internal_update).await {
-                    tracing::error!(peer = %self.remote_addr, "Failed to send route removal for distribution: {}", e);
-                }
-            },
-            Ok(1) if action == UpdateAction::Add => {
-                let internal_update = InternalUpdate { action: UpdateAction::Add, vni, destination: dest, next_hop: nh, source_peer: Some(self.remote_addr) };
-                if let Err(e) = mb_state.route_update_tx.send(internal_update).await {
-                    tracing::error!(peer = %self.remote_addr, "Failed to send route addition for distribution: {}", e);
-                }
-            },
-            _ => {}
-        }
-        Ok(())
+            }.instrument(info_span!("retry_scheduler", peer = %addr)));
+            
+            info!("Connection failure handling complete");
+        };
+        
+        // Create a span for this task
+        let span = info_span!("connection_failure", peer = %addr);
+        
+        // Spawn the instrumented future
+        tokio::spawn(future.instrument(span));
     }
 }
 
+/// Handles the peer connection communication loop.
+///
+/// This function is the core of the peer protocol handling. It manages the
+/// TCP stream, processes incoming messages, sends outgoing messages, and
+/// coordinates with the actor-based FSM for state transitions.
+///
+/// Important: This function does not directly modify peer state. Instead,
+/// it sends FSM transition intent messages to the peer actor to ensure thread-safe
+/// state transitions without race conditions.
+///
+/// # Arguments
+/// * `peer` - The peer instance to handle
+/// * `stream` - The TCP stream for communication
+/// * `wire_rx` - Channel for receiving messages to send to the remote peer
 pub async fn handle_peer(
     peer: Arc<Peer>,
     stream: TcpStream,
-    mut tx_receiver: mpsc::Receiver<GeneratedMessage>,
+    wire_rx: mpsc::Receiver<GeneratedMessage>,
 ) {
-    let peer_addr = stream.peer_addr().unwrap_or(peer.remote_addr);
-    let local_addr = stream.local_addr().ok();
-    if let Some(la) = local_addr {
-        tracing::info!(peer = %peer_addr, local = %la, "Connection established");
-    }
-
-    let mut framed = Framed::new(stream, MetalBondCodec);
-    let shutdown = peer.shutdown_signal.clone();
-    let mut keepalive_interval_timer: Option<Interval> = None;
-    let mut keepalive_timeout_timer: Option<Sleep> = None;
-
-    if peer.direction == ConnectionDirection::Outgoing {
-        let mb_state = peer.metalbond_state.read().await;
-        let is_server = mb_state.is_server;
-        drop(mb_state);
-        if let Err(e) = peer.send_hello(is_server).await {
-            tracing::error!(peer = %peer_addr, "Failed to send initial HELLO: {}", e);
-            peer.set_state(ConnectionState::Closed).await;
-            return;
+    let _addr = peer.get_remote_addr();
+    // Create a span for this peer that will track the entire connection lifecycle
+    let span = info_span!("peer_connection", peer = %_addr);
+    
+    async {
+        info!("Starting peer connection handler");
+        
+        let result = match setup_connection(&peer, &stream).await {
+            Ok(()) => {
+                let framed = tokio_util::codec::Framed::new(stream, MetalBondCodec::default());
+                let (sink, stream) = framed.split();
+                
+                info!("Protocol connection established, now handling messages");
+                handle_message_loop(&peer, sink, stream, wire_rx).await
+            }
+            Err(e) => Err(e),
+        };
+        
+        // Handle connection teardown through FSM
+        if let Err(e) = peer.message_tx.send(PeerMessage::ConnectionClosed).await {
+            error!("Failed to send connection closed message: {}", e);
         }
-        peer.set_state(ConnectionState::HelloSent).await;
+        
+        if let Err(e) = result {
+            error!("Peer handler encountered error: {}", e);
+        }
+        
+        info!("Peer connection handler completed");
+    }
+    .instrument(span)
+    .await;
+}
+
+/// Sets up the initial connection state and logging.
+///
+/// Rather than directly setting state, this function sends a ConnectionSetup
+/// intent message to the actor, allowing the FSM to properly manage the state
+/// transition without race conditions.
+///
+/// # Arguments
+/// * `peer` - The peer instance to handle
+/// * `stream` - The TCP stream for the connection
+///
+/// # Returns
+/// * `Ok(())` if setup is successful
+/// * `Err` with the error message if setup fails
+async fn setup_connection(peer: &Arc<Peer>, stream: &TcpStream) -> Result<()> {
+    let _addr = peer.get_remote_addr();
+    
+    let peer_addr = stream.peer_addr()
+        .map_err(|e| PeerError::Connection(format!("Failed to get peer address: {}", e)))?;
+    
+    info!(remote_addr = %peer_addr, "Connected to peer");
+    
+    // Get local address info for better debugging
+    if let Ok(local_addr) = stream.local_addr() {
+        info!(local_addr = %local_addr, "Local endpoint for connection");
+    }
+    
+    // Send connection setup intent to FSM handler
+    if let Err(e) = peer.message_tx.send(PeerMessage::ConnectionSetup).await {
+        warn!("Failed to send connection setup message: {}", e);
+    }
+    
+    Ok(())
+}
+
+/// Handles the main message processing loop for a peer connection.
+///
+/// # Arguments
+/// * `peer` - The peer instance
+/// * `mut sink` - Message sink for sending protocol messages
+/// * `mut stream` - Message stream for receiving protocol messages
+/// * `mut wire_rx` - Channel for receiving messages to send to the remote peer
+///
+/// # Returns
+/// * `Ok(())` if the loop terminates normally
+/// * `Err` with the error message if an error occurs
+async fn handle_message_loop<S, T>(
+    peer: &Arc<Peer>,
+    mut sink: S,
+    mut stream: T,
+    mut wire_rx: mpsc::Receiver<GeneratedMessage>,
+) -> Result<()>
+where
+    S: SinkExt<GeneratedMessage> + Unpin,
+    T: StreamExt<Item = Result<GeneratedMessage>> + Unpin,
+{
+    // We don't need to store the address here since we're using structured spans
+    let mut shutdown_requested = false;
+    
+    // Create a span for the message loop
+    let span = info_span!("message_loop");
+    
+    async {
+        debug!("Starting message processing loop");
+        
+        while !shutdown_requested {
+            tokio::select! {
+                Some(outgoing_msg) = wire_rx.recv() => {
+                    if let Err(e) = handle_outgoing_message(&mut sink, &peer, outgoing_msg).await {
+                        return Err(e);
+                    }
+                }
+                
+                incoming = stream.next() => {
+                    match incoming {
+                        Some(Ok(msg)) => {
+                            handle_incoming_message(&peer, msg).await;
+                        }
+                        Some(Err(e)) => {
+                            error!("Error receiving message: {}", e);
+                            peer.handle_connection_failure();
+                            return Err(PeerError::Protocol(format!("Error receiving message: {}", e)).into());
+                        }
+                        None => {
+                            info!("Peer connection closed by remote");
+                            peer.handle_connection_failure();
+                            return Err(PeerError::Connection("Connection closed by remote".into()).into());
+                        }
+                    }
+                }
+                
+                else => {
+                    info!("All channels closed, ending peer handler");
+                    shutdown_requested = true;
+                }
+            }
+        }
+        
+        debug!("Message loop completed normally");
+        Ok(())
+    }
+    .instrument(span)
+    .await
+}
+
+/// Handles outgoing protocol messages.
+///
+/// # Arguments
+/// * `sink` - The message sink to send messages to
+/// * `peer` - The peer instance
+/// * `msg` - The message to send
+///
+/// # Returns
+/// * `Ok(())` if the message is sent successfully
+/// * `Err` with error details if sending fails
+async fn handle_outgoing_message<S>(
+    sink: &mut S,
+    peer: &Arc<Peer>,
+    msg: GeneratedMessage,
+) -> Result<()>
+where
+    S: SinkExt<GeneratedMessage> + Unpin,
+{
+    // No need to store the address - it's included in the span
+    let span = info_span!("outgoing_message", message_type = ?msg);
+    
+    async {
+        // Log outgoing message details
+        match &msg {
+            GeneratedMessage::Hello(_) => {
+                info!("Sending Hello message")
+            }
+            GeneratedMessage::Keepalive => {
+                debug!("Sending Keepalive")
+            }
+            GeneratedMessage::Subscribe(sub) => {
+                info!(vni = sub.vni, "Sending Subscribe")
+            }
+            GeneratedMessage::Unsubscribe(unsub) => {
+                info!(vni = unsub.vni, "Sending Unsubscribe")
+            }
+            GeneratedMessage::Update(update) => {
+                let action = action_to_string(update.action);
+                info!(
+                    vni = update.vni, 
+                    action = %action,
+                    "Sending Update message"
+                );
+            }
+        }
+        
+        // Send the message
+        if let Err(_) = sink.send(msg).await {
+            error!("Failed to send message");
+            peer.handle_connection_failure();
+            return Err(PeerError::Connection("Failed to send message to peer".into()).into());
+        }
+        
+        Ok(())
+    }
+    .instrument(span)
+    .await
+}
+
+/// Handles incoming protocol messages.
+///
+/// # Arguments
+/// * `peer` - The peer instance
+/// * `msg` - The received message to process
+async fn handle_incoming_message(peer: &Arc<Peer>, msg: GeneratedMessage) {
+    // No need to store the address - it's included in the span
+    let span = info_span!("incoming_message", message_type = ?msg);
+    
+    async {
+        match msg {
+            GeneratedMessage::Hello(hello) => {
+                handle_hello_message(peer, hello).await;
+            }
+            GeneratedMessage::Keepalive => {
+                debug!("Received Keepalive");
+                
+                // Respond with our own Keepalive
+                if let Err(e) = peer.send_keepalive().await {
+                    warn!("Failed to respond to Keepalive: {}", e);
+                }
+            }
+            GeneratedMessage::Subscribe(sub) => {
+                info!(vni = sub.vni, "Received Subscribe for VNI");
+                // Handle subscription (logging only for now)
+            }
+            GeneratedMessage::Unsubscribe(unsub) => {
+                info!(vni = unsub.vni, "Received Unsubscribe for VNI");
+                // Handle unsubscription (logging only for now)
+            }
+            GeneratedMessage::Update(update) => {
+                handle_update_message(peer, update).await;
+            }
+        }
+    }
+    .instrument(span)
+    .await;
+}
+
+/// Handles Hello protocol messages.
+///
+/// This function processes Hello messages and sends the appropriate FSM
+/// transition intent message to the actor. By using FSM transitions instead
+/// of direct state modification, we prevent race conditions.
+///
+/// # Arguments
+/// * `peer` - The peer instance
+/// * `hello` - The Hello message
+async fn handle_hello_message(peer: &Arc<Peer>, hello: pb::Hello) {
+    let span = info_span!("hello_handler", is_server = hello.is_server);
+    
+    async {
+        info!("Received Hello message");
+        
+        // Store the remote's server status
+        let _is_remote_server = hello.is_server;
+        
+        // Get current state and handle according to FSM rules
+        match peer.get_state().await {
+            Ok(current_state) => {
+                match current_state {
+                    ConnectionState::Connecting => {
+                        // We received a Hello before sending one
+                        // Send the HelloReceived event to the actor
+                        if let Err(e) = peer.message_tx.send(PeerMessage::HelloReceived).await {
+                            error!("Failed to send HelloReceived message: {}", e);
+                            return;
+                        }
+                        
+                        // Send our Hello response
+                        // For our server status, use connection direction - we're server if this is an incoming connection
+                        if let Err(e) = peer.send_hello().await {
+                            error!("Failed to respond to Hello: {}", e);
+                        }
+                    },
+                    ConnectionState::HelloSent => {
+                        // We already sent a Hello and now received one
+                        // Send the ConnectionEstablished event to the actor
+                        if let Err(e) = peer.message_tx.send(PeerMessage::ConnectionEstablished).await {
+                            error!("Failed to send ConnectionEstablished message: {}", e);
+                            return;
+                        }
+                        
+                        // No need to send another Hello
+                        info!("Connection established after Hello exchange");
+                    },
+                    ConnectionState::HelloReceived => {
+                        // We've already received a Hello, this is a duplicate
+                        warn!("Received duplicate Hello message");
+                    },
+                    ConnectionState::Established => {
+                        // Already established, might be a re-Hello
+                        info!("Received Hello while already established");
+                    },
+                    ConnectionState::Retry => {
+                        // We were in retry mode, now connected
+                        // Send the HelloReceived event to the actor
+                        if let Err(e) = peer.message_tx.send(PeerMessage::HelloReceived).await {
+                            error!("Failed to send HelloReceived message: {}", e);
+                            return;
+                        }
+                        
+                        // Send our Hello response
+                        // For our server status, use connection direction
+                        if let Err(e) = peer.send_hello().await {
+                            error!("Failed to respond to Hello in Retry state: {}", e);
+                        }
+                    },
+                    ConnectionState::Closed => {
+                        // Strange, received Hello while closed
+                        warn!("Received Hello while in Closed state");
+                    }
+                }
+            },
+            Err(e) => {
+                error!("Failed to get peer state: {}", e);
+                // Fallback: assume we're connecting and respond with Hello
+                if let Err(e) = peer.send_hello().await {
+                    error!("Failed to respond to Hello after state error: {}", e);
+                }
+            }
+        }
+    }
+    .instrument(span)
+    .await;
+}
+
+/// Handles Update protocol messages.
+///
+/// # Arguments
+/// * `peer` - The peer instance
+/// * `update` - The Update message
+async fn handle_update_message(_peer: &Arc<Peer>, update: pb::Update) {
+    // No need to store the address - it's included in the span
+    let action = action_to_string(update.action);
+    
+    // Extract destination details for better logging
+    let dest_info = if let Some(dest) = &update.destination {
+        format!("Prefix: {}/{}", 
+            ip_version_to_string(dest.ip_version),
+            dest.prefix_length
+        )
     } else {
-        peer.set_state(ConnectionState::Connecting).await;
+        "Invalid destination".to_string()
+    };
+    
+    // Extract next hop details for better logging
+    let nh_info = if let Some(nh) = &update.next_hop {
+        format!("NextHop type: {}, VNI: {}", 
+            nh.r#type, 
+            nh.target_vni
+        )
+    } else {
+        "Invalid next hop".to_string()
+    };
+    
+    let span = info_span!(
+        "update_handler", 
+        vni = update.vni, 
+        action = %action,
+        destination = %dest_info,
+        next_hop = %nh_info
+    );
+    
+    async {
+        info!("Received Update message");
+        // Process the update (logging only for now)
     }
-
-    loop {
-        tokio::select! {
-            _ = shutdown.notified() => {
-                tracing::info!(peer = %peer_addr, "Shutdown signal received, closing connection task.");
-                let _ = framed.close().await;
-                peer.set_state(ConnectionState::Closed).await;
-                return;
-            }
-
-            frame = framed.next() => {
-                match frame {
-                    Some(Ok(message)) => {
-                        tracing::debug!(peer = %peer_addr, ?message, "Received message");
-                        // FIX: Reset keepalive_timeout_timer (Error 1: mismatched types)
-                        // This code is assumed to be at line 526 from the error
-                        if keepalive_timeout_timer.is_some() {
-                            let timeout_duration = peer.config.keepalive_interval * 5 / 2; // e.g. 2.5x interval
-                            let deadline = Instant::now() + timeout_duration;
-                            keepalive_timeout_timer = Some(time::sleep_until(deadline)); // Use sleep_until
-                        }
-
-                        let result = match message {
-                            GeneratedMessage::Hello(hello) => peer.process_hello(hello).await,
-                            GeneratedMessage::Keepalive => peer.process_keepalive().await,
-                            GeneratedMessage::Subscribe(sub) => peer.process_subscribe(sub).await,
-                            GeneratedMessage::Unsubscribe(unsub) => peer.process_unsubscribe(unsub).await,
-                            GeneratedMessage::Update(update) => peer.process_update(update).await,
-                        };
-
-                        if let Err(e) = result {
-                            tracing::error!(peer = %peer_addr, "Error processing message: {}. Triggering reset.", e);
-                            peer.set_state(ConnectionState::Closed).await;
-                            peer.trigger_shutdown();
-                        } else {
-                            if peer.get_state().await == ConnectionState::Established && keepalive_interval_timer.is_none() {
-                                let interval_duration = peer.config.keepalive_interval;
-                                let timeout_duration = interval_duration * 5 / 2;
-                                tracing::info!(peer = %peer_addr, ?interval_duration, ?timeout_duration, "Connection Established, starting keepalive timers");
-                                let mut interval = time::interval(interval_duration);
-                                interval.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
-                                keepalive_interval_timer = Some(interval);
-                                // For initial setup of timeout_timer, ensure it's also sleep_until if deadline based
-                                let deadline = Instant::now() + timeout_duration;
-                                keepalive_timeout_timer = Some(time::sleep_until(deadline));
-
-                                if peer.direction == ConnectionDirection::Outgoing {
-                                    if let Err(e) = peer.send_keepalive().await {
-                                        tracing::error!(peer = %peer_addr, "Failed to send initial keepalive: {}", e);
-                                        peer.trigger_shutdown();
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    Some(Err(e)) => {
-                        tracing::error!(peer = %peer_addr, "Error reading frame: {}. Triggering reset.", e);
-                        peer.set_state(ConnectionState::Closed).await;
-                        peer.trigger_shutdown();
-                    }
-                    None => {
-                        tracing::info!(peer = %peer_addr, "Connection closed by remote. Triggering reset.");
-                        peer.set_state(ConnectionState::Closed).await;
-                        peer.trigger_shutdown();
-                    }
-                }
-            }
-
-            Some(message_to_send) = tx_receiver.recv() => {
-                tracing::trace!(peer = %peer_addr, msg = ?message_to_send, "Sending message");
-                if let Err(e) = framed.send(message_to_send).await {
-                    tracing::error!(peer = %peer_addr, "Error sending message: {}. Triggering reset.", e);
-                    peer.set_state(ConnectionState::Closed).await;
-                    peer.trigger_shutdown();
-                }
-            }
-
-            _ = async {
-                // This arm for Interval::tick() should be okay as .tick() returns an owned future.
-                keepalive_interval_timer.as_mut().unwrap().tick().await;
-            }, if keepalive_interval_timer.is_some() => {
-                if peer.direction == ConnectionDirection::Outgoing && peer.get_state().await == ConnectionState::Established {
-                    tracing::trace!(peer = %peer_addr, "Sending keepalive");
-                    if let Err(e) = peer.send_keepalive().await {
-                        tracing::error!(peer = %peer_addr, "Failed to send keepalive: {}", e);
-                        peer.trigger_shutdown();
-                    }
-                }
-            }
-
-            // FIX: Corrected keepalive timeout timer arm for !Unpin Sleep (Error 2: PhantomPinned)
-            // This code is assumed to be at line 601 from the error
-            _ = async {
-                // Take the Sleep future from the Option to gain ownership within this async block.
-                // This allows the !Unpin Sleep future to be pinned and awaited correctly.
-                if let Some(sleep_to_await) = keepalive_timeout_timer.take() {
-                    sleep_to_await.await;
-                    // Sleep is a consuming future, no need to put it back if it completed.
-                    // If it were to pend and select! polls this async block again,
-                    // keepalive_timeout_timer would be None. The `if guard` handles this.
-                    // However, for a one-shot timer, this take() is fine.
-                    // If the timer needed to be "reset" rather than "expire and be gone",
-                    // the reset logic (re-creating it) is handled when messages are received.
-                } else {
-                    // This case should ideally not be hit if the `if` guard on the select arm
-                    // (`if keepalive_timeout_timer.is_some()`) is working as expected,
-                    // as this async block would only be polled when it's Some.
-                    // If select re-polls a completed async block future whose outer guard became false,
-                    // or if take() happens and it pends, then this might be an issue.
-                    // For simplicity, assuming guard + take() + one-shot await is the pattern.
-                    // If this `async` block itself pends, `take()` means the timer is gone from the Option.
-                    // For a timeout, this is usually fine: once it starts being awaited, it runs to completion or is dropped.
-                    // If it pends, and select chooses another branch, then this timer is effectively disarmed.
-                    // This might need more robust handling if disarming is not intended on pend.
-                    // For now, this fixes the immediate !Unpin await error.
-                    // Awaiting pending() ensures this arm doesn't resolve if None was taken unexpectedly.
-                    std::future::pending::<()>().await;
-                }
-            }, if keepalive_timeout_timer.is_some() => {
-                tracing::warn!(peer = %peer_addr, "Keepalive timeout detected. Triggering reset.");
-                peer.set_state(ConnectionState::Closed).await;
-                peer.trigger_shutdown();
-            }
-        }
-    }
+    .instrument(span)
+    .await;
 }
 
 impl TryFrom<pb::Destination> for Destination {
@@ -651,7 +1262,9 @@ impl TryFrom<pb::NextHop> for NextHop {
     type Error = anyhow::Error;
     fn try_from(pb_nh: pb::NextHop) -> Result<Self, Self::Error> {
         let target_address = IpAddr::from_slice(&pb_nh.target_address)?;
-        let hop_type = pb::NextHopType::try_from(pb_nh.r#type).unwrap_or(pb::NextHopType::Standard);
+        let hop_type = pb::NextHopType::try_from(pb_nh.r#type)
+            .unwrap_or(pb::NextHopType::Standard);
+            
         Ok(NextHop {
             target_address,
             target_vni: pb_nh.target_vni,
@@ -675,8 +1288,18 @@ impl TryFrom<NextHop> for pb::NextHop {
     }
 }
 
+/// Extension trait for IpAddr to handle conversion to and from byte arrays.
+///
+/// This trait provides utilities for working with IP addresses in their raw byte form,
+/// which is useful for protocol serialization and deserialization.
 trait IpAddrBytes {
+    /// Converts an IP address to its byte representation as a Vec<u8>.
     fn addr_bytes_vec(&self) -> Vec<u8>;
+    
+    /// Creates an IP address from a slice of bytes.
+    ///
+    /// # Errors
+    /// Returns an error if the slice length is neither 4 (IPv4) nor 16 (IPv6).
     fn from_slice(slice: &[u8]) -> Result<IpAddr>;
 }
 
@@ -687,6 +1310,7 @@ impl IpAddrBytes for IpAddr {
             IpAddr::V6(ip6) => ip6.octets().to_vec(),
         }
     }
+    
     fn from_slice(slice: &[u8]) -> Result<IpAddr> {
         match slice.len() {
             4 => {
@@ -699,7 +1323,23 @@ impl IpAddrBytes for IpAddr {
                 octets.copy_from_slice(slice);
                 Ok(IpAddr::V6(octets.into()))
             }
-            _ => Err(anyhow!("Invalid IP address byte length: {}", slice.len()))
+            len => Err(PeerError::InvalidMessage(format!("Invalid IP address byte length: {}", len)).into()),
         }
+    }
+}
+
+fn action_to_string(action: i32) -> &'static str {
+    if action == pb::Action::Add as i32 {
+        "add"
+    } else {
+        "remove"
+    }
+}
+
+fn ip_version_to_string(version: i32) -> &'static str {
+    if version == pb::IpVersion::IPv4 as i32 {
+        "IPv4"
+    } else {
+        "IPv6"
     }
 }

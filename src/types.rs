@@ -80,20 +80,41 @@ impl fmt::Display for NextHop {
     }
 }
 
+/// Indicates the direction of a peer connection.
+///
+/// - Incoming: Connections initiated by a remote peer to us (we are the server)
+/// - Outgoing: Connections initiated by us to a remote peer (we are the client)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnectionDirection {
     Incoming,
     Outgoing,
 }
 
+/// Connection state for a peer.
+///
+/// This enum represents the states of the Finite State Machine (FSM) that
+/// manages the peer connection lifecycle. The states follow a progression:
+///
+/// CLOSED -> CONNECTING -> (HELLO_SENT or HELLO_RECEIVED) -> ESTABLISHED -> CLOSED
+///                      |                                  |
+///                      +----------------> RETRY <---------+
+///
+/// State transitions should only happen through the actor model to prevent race conditions.
+/// External code should express transition intents rather than directly changing states.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnectionState {
-    Connecting,
-    HelloSent,
-    HelloReceived,
-    Established,
-    Retry,
+    /// Connection is closed
     Closed,
+    /// Connection is being established
+    Connecting,
+    /// Hello message sent, waiting for response
+    HelloSent,
+    /// Hello message received, need to send response
+    HelloReceived,
+    /// Connection established and operational
+    Established,
+    /// Connection failed and will be retried
+    Retry,
 }
 
 impl fmt::Display for ConnectionState {
