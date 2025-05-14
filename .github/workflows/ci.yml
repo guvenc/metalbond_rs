@@ -57,5 +57,8 @@ jobs:
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2
 
-      - name: Build
-        run: cargo build --release 
+      - name: Build metalbond-server
+        run: cargo build --bin metalbond-server --release
+
+      - name: Build metalbond-client
+        run: cargo build --bin metalbond-client --release
