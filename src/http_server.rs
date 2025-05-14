@@ -1,4 +1,4 @@
-use crate::metalbond::MetalBondState;
+use crate::routetable::RouteTable;
 use crate::types::{Destination, NextHop, Vni};
 use anyhow::Result;
 use askama::Template;
@@ -11,15 +11,15 @@ use axum::{
 };
 use serde::Serialize;
 use std::collections::BTreeMap; // Use BTreeMap for sorted output
-// Removed unused: use std::net::SocketAddr;
+                                // Removed unused: use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::sync::RwLock;
 use tokio::net::TcpListener;
 
 #[derive(Serialize)]
 struct JsonRoutes {
     date: String,
-    #[serde(serialize_with = "crate::http_server::serialize_vnet_map::serialize")] // Corrected path to function
+    #[serde(serialize_with = "crate::http_server::serialize_vnet_map::serialize")]
+    // Corrected path to function
     vnet: BTreeMap<Vni, BTreeMap<Destination, Vec<NextHop>>>, // Use BTreeMap for sorting
     metalbond_version: String,
 }
@@ -46,10 +46,13 @@ mod serialize_vnet_map {
 
     struct SerializeDestMap<'a>(&'a BTreeMap<Destination, Vec<NextHop>>);
 
-    impl<'a> Serialize for SerializeDestMap<'a> {
-        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error> where S: Serializer {
+    impl Serialize for SerializeDestMap<'_> {
+        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: Serializer,
+        {
             let mut map_ser = serializer.serialize_map(Some(self.0.len()))?;
-            for(k,v) in self.0 {
+            for (k, v) in self.0 {
                 map_ser.serialize_entry(&k.to_string(), v)?;
             }
             map_ser.end()
@@ -71,17 +74,16 @@ fn now_string() -> String {
     chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
 }
 
-async fn get_route_data(State(state): State<Arc<RwLock<MetalBondState>>>) -> JsonRoutes {
-    let metalbond_state = state.read().await;
+async fn get_route_data(State(route_table): State<Arc<RouteTable>>) -> JsonRoutes {
     let mut vnet_map: BTreeMap<Vni, BTreeMap<Destination, Vec<NextHop>>> = BTreeMap::new();
 
-    for vni in metalbond_state.route_table.get_vnis().await {
-        let dest_map = metalbond_state.route_table.get_destinations_by_vni(vni).await;
+    for vni in route_table.get_vnis().await {
+        let dest_map = route_table.get_destinations_by_vni(vni).await;
         // Convert HashMap to BTreeMap for sorting destinations
         let mut sorted_dest_map = BTreeMap::new();
         for (dest, mut hops) in dest_map {
-            // Sort hops consistently (e.g., by string representation)
-            hops.sort_by(|a, b| a.to_string().cmp(&b.to_string()));
+            // Sort hops consistently by string representation
+            hops.sort_by_key(|a| a.to_string());
             sorted_dest_map.insert(dest, hops); // Destination needs Ord - IpNet doesn't have it, use wrapper or string key
         }
 
@@ -90,7 +92,6 @@ async fn get_route_data(State(state): State<Arc<RwLock<MetalBondState>>>) -> Jso
         }
     }
 
-
     JsonRoutes {
         date: now_string(),
         vnet: vnet_map,
@@ -98,25 +99,23 @@ async fn get_route_data(State(state): State<Arc<RwLock<MetalBondState>>>) -> Jso
     }
 }
 
-
-async fn main_handler(state: State<Arc<RwLock<MetalBondState>>>) -> Result<Html<String>, AppError> {
+async fn main_handler(state: State<Arc<RouteTable>>) -> Result<Html<String>, AppError> {
     let data = get_route_data(state).await;
     let template = IndexTemplate {
         date: data.date,
-        vnet: data.vnet, // Assuming IndexTemplate takes BTreeMap
+        vnet: data.vnet,
         metalbond_version: data.metalbond_version,
     };
     let html = template.render()?;
     Ok(Html(html))
 }
 
-
-async fn json_handler(state: State<Arc<RwLock<MetalBondState>>>) -> Result<Json<JsonRoutes>, AppError> {
+async fn json_handler(state: State<Arc<RouteTable>>) -> Result<Json<JsonRoutes>, AppError> {
     let data = get_route_data(state).await;
     Ok(Json(data))
 }
 
-async fn yaml_handler(state: State<Arc<RwLock<MetalBondState>>>) -> Result<Yaml<JsonRoutes>, AppError> {
+async fn yaml_handler(state: State<Arc<RouteTable>>) -> Result<Yaml<JsonRoutes>, AppError> {
     let data = get_route_data(state).await;
     Ok(Yaml(data))
 }
@@ -130,11 +129,7 @@ where
 {
     fn into_response(self) -> Response {
         match serde_yaml::to_string(&self.0) {
-            Ok(yaml) => (
-                StatusCode::OK,
-                [("content-type", "text/yaml")],
-                yaml,
-            ).into_response(),
+            Ok(yaml) => (StatusCode::OK, [("content-type", "text/yaml")], yaml).into_response(),
             Err(err) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("Failed to serialize YAML: {}", err),
@@ -143,7 +138,6 @@ where
         }
     }
 }
-
 
 // Centralized error handling for Axum handlers
 struct AppError(anyhow::Error);
@@ -168,13 +162,12 @@ where
     }
 }
 
-
-pub async fn run_http_server(listen_addr: String, state: Arc<RwLock<MetalBondState>>) -> Result<()> {
+pub async fn run_http_server(listen_addr: String, route_table: Arc<RouteTable>) -> Result<()> {
     let app = Router::new()
         .route("/", get(main_handler))
         .route("/routes.json", get(json_handler))
         .route("/routes.yaml", get(yaml_handler))
-        .with_state(state);
+        .with_state(route_table);
 
     let listener = TcpListener::bind(&listen_addr).await?;
     tracing::info!("HTTP server listening on {}", listen_addr);
@@ -194,7 +187,9 @@ impl PartialOrd for Destination {
 
 impl Ord for Destination {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.prefix.addr().cmp(&other.prefix.addr())
+        self.prefix
+            .addr()
+            .cmp(&other.prefix.addr())
             .then_with(|| self.prefix.prefix_len().cmp(&other.prefix.prefix_len()))
     }
 }
@@ -208,7 +203,8 @@ impl PartialOrd for NextHop {
 impl Ord for NextHop {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         // Define a consistent ordering based on fields
-        self.target_address.cmp(&other.target_address)
+        self.target_address
+            .cmp(&other.target_address)
             .then_with(|| self.target_vni.cmp(&other.target_vni))
             .then_with(|| self.hop_type.cmp(&other.hop_type)) // Assuming generated enum has Ord
             .then_with(|| self.nat_port_range_from.cmp(&other.nat_port_range_from))

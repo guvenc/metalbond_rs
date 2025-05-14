@@ -14,8 +14,9 @@ pub trait Client: Send + Sync {
 pub struct DummyClient {}
 
 impl DummyClient {
-    pub fn new() -> Self {
-        DummyClient {}
+    pub async fn new() -> Result<Self> {
+        tracing::info!("Creating DummyClient (no netlink support)");
+        Ok(DummyClient {})
     }
 }
 
