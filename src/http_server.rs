@@ -1,25 +1,17 @@
 use crate::routetable::RouteTable;
 use crate::types::{Destination, NextHop, Vni};
-use anyhow::Result;
-use askama::Template;
-use axum::{
-    extract::State,
-    http::StatusCode,
-    response::{Html, IntoResponse, Response},
-    routing::get,
-    Json, Router,
+use actix_web::{
+    get, web, App, HttpResponse, HttpServer, Responder, Result as ActixResult,
 };
+use anyhow::Result;
 use serde::Serialize;
 use std::collections::BTreeMap; // Use BTreeMap for sorted output
-                                // Removed unused: use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::net::TcpListener;
 
 #[derive(Serialize)]
 struct JsonRoutes {
     date: String,
     #[serde(serialize_with = "crate::http_server::serialize_vnet_map::serialize")]
-    // Corrected path to function
     vnet: BTreeMap<Vni, BTreeMap<Destination, Vec<NextHop>>>, // Use BTreeMap for sorting
     metalbond_version: String,
 }
@@ -60,21 +52,13 @@ mod serialize_vnet_map {
     }
 }
 
-#[derive(Template)]
-#[template(path = "index.html", escape = "html")]
-struct IndexTemplate {
-    _date: String,
-    _vnet: BTreeMap<Vni, BTreeMap<Destination, Vec<NextHop>>>, // Use BTreeMap for sorting
-    _metalbond_version: String,
-}
-
 // Helper to get current timestamp string
 fn now_string() -> String {
     // Using chrono crate for formatting
     chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
 }
 
-async fn get_route_data(State(route_table): State<Arc<RouteTable>>) -> JsonRoutes {
+async fn get_route_data(route_table: web::Data<Arc<RouteTable>>) -> JsonRoutes {
     let mut vnet_map: BTreeMap<Vni, BTreeMap<Destination, Vec<NextHop>>> = BTreeMap::new();
 
     for vni in route_table.get_vnis().await {
@@ -99,80 +83,47 @@ async fn get_route_data(State(route_table): State<Arc<RouteTable>>) -> JsonRoute
     }
 }
 
-async fn main_handler(state: State<Arc<RouteTable>>) -> Result<Html<String>, AppError> {
-    let data = get_route_data(state).await;
-    let template = IndexTemplate {
-        _date: data.date,
-        _vnet: data.vnet,
-        _metalbond_version: data.metalbond_version,
-    };
-    let html = template.render()?;
-    Ok(Html(html))
+#[get("/")]
+async fn index() -> ActixResult<HttpResponse> {
+    let html = include_str!("../html/index.html");
+    
+    Ok(HttpResponse::Ok()
+        .content_type("text/html")
+        .body(html))
 }
 
-async fn json_handler(state: State<Arc<RouteTable>>) -> Result<Json<JsonRoutes>, AppError> {
-    let data = get_route_data(state).await;
-    Ok(Json(data))
+#[get("/routes.json")]
+async fn json_handler(route_table: web::Data<Arc<RouteTable>>) -> impl Responder {
+    let data = get_route_data(route_table).await;
+    web::Json(data)
 }
 
-async fn yaml_handler(state: State<Arc<RouteTable>>) -> Result<Yaml<JsonRoutes>, AppError> {
-    let data = get_route_data(state).await;
-    Ok(Yaml(data))
+#[get("/routes.yaml")]
+async fn yaml_handler(route_table: web::Data<Arc<RouteTable>>) -> ActixResult<HttpResponse> {
+    let data = get_route_data(route_table).await;
+    let yaml = serde_yaml::to_string(&data).map_err(|e| {
+        tracing::error!("YAML serialization error: {}", e);
+        actix_web::error::ErrorInternalServerError("YAML serialization error")
+    })?;
+    Ok(HttpResponse::Ok().content_type("text/yaml").body(yaml))
 }
 
-// Custom response type for YAML
-struct Yaml<T>(T);
-
-impl<T> IntoResponse for Yaml<T>
-where
-    T: Serialize,
-{
-    fn into_response(self) -> Response {
-        match serde_yaml::to_string(&self.0) {
-            Ok(yaml) => (StatusCode::OK, [("content-type", "text/yaml")], yaml).into_response(),
-            Err(err) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to serialize YAML: {}", err),
-            )
-                .into_response(),
-        }
-    }
-}
-
-// Centralized error handling for Axum handlers
-struct AppError(anyhow::Error);
-
-impl IntoResponse for AppError {
-    fn into_response(self) -> Response {
-        tracing::error!("HTTP handler error: {:?}", self.0);
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Internal server error: {}", self.0),
-        )
-            .into_response()
-    }
-}
-
-impl<E> From<E> for AppError
-where
-    E: Into<anyhow::Error>,
-{
-    fn from(err: E) -> Self {
-        Self(err.into())
-    }
-}
-
-pub async fn run_http_server(listen_addr: String, route_table: Arc<RouteTable>) -> Result<()> {
-    let app = Router::new()
-        .route("/", get(main_handler))
-        .route("/routes.json", get(json_handler))
-        .route("/routes.yaml", get(yaml_handler))
-        .with_state(route_table);
-
-    let listener = TcpListener::bind(&listen_addr).await?;
-    tracing::info!("HTTP server listening on {}", listen_addr);
-    axum::serve(listener, app).await?;
-    Ok(())
+pub fn run_http_server(listen_addr: String, route_table: Arc<RouteTable>) -> std::io::Result<actix_web::dev::Server> {
+    tracing::info!("Starting HTTP server on {}", listen_addr);
+    
+    let route_table = web::Data::new(route_table);
+    
+    let server = HttpServer::new(move || {
+        App::new()
+            .app_data(route_table.clone())
+            .service(index)
+            .service(json_handler)
+            .service(yaml_handler)
+    })
+    .bind(&listen_addr)?
+    .run();
+    
+    Ok(server)
 }
 
 // ---- Askama Ord/PartialOrd implementations for map keys ----

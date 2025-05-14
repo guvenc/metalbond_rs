@@ -1,7 +1,7 @@
 #![cfg(any(feature = "netlink-support", target_os = "linux"))]
 
 use anyhow::{anyhow, Context, Result};
-use clap::{Parser, Subcommand};
+use clap::Parser;
 use metalbond::pb;
 use metalbond::{Config, Destination, MetalBond, NetlinkClient, NetlinkClientConfig, NextHop, Vni};
 use std::collections::HashMap;
@@ -108,7 +108,11 @@ async fn main() -> Result<()> {
                 .context("Cannot create Netlink Client")?,
         )
     } else {
-        Arc::new(metalbond::client::DummyClient::new())
+        Arc::new(
+            metalbond::client::DummyClient::new()
+                .await
+                .context("Cannot create Dummy Client")?
+        )
     };
 
     // Create MetalBond instance

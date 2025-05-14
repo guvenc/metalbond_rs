@@ -1,6 +1,6 @@
 use anyhow::Result;
 use clap::Parser;
-use metalbond::{Config, DefaultNetworkClient, MetalBond};
+use metalbond::{Config, MetalBond};
 use std::sync::Arc;
 use tracing_subscriber::{EnvFilter, FmtSubscriber};
 
@@ -43,34 +43,29 @@ async fn main() -> Result<()> {
         config.keepalive_interval = std::time::Duration::from_secs(secs);
     }
 
-    // Create appropriate client (dummy on non-Linux)
-    #[cfg(not(any(feature = "netlink-support", target_os = "linux")))]
-    let client: Arc<dyn metalbond::client::Client> = Arc::new(DefaultNetworkClient::new().await?);
-
-    #[cfg(any(feature = "netlink-support", target_os = "linux"))]
-    let client: Arc<dyn metalbond::client::Client> = Arc::new({
-        // Create a basic NetlinkClientConfig with default values
-        let netlink_config = metalbond::NetlinkClientConfig {
-            vni_table_map: std::collections::HashMap::new(),
-            link_name: "lo".to_string(), // Default to loopback interface
-            ipv4_only: false,
-        };
-        DefaultNetworkClient::new(netlink_config).await?
-    });
+    // Create client - always use DummyClient for the server
+    let client: Arc<dyn metalbond::client::Client> = Arc::new(metalbond::client::DummyClient::new().await?);
 
     // Create and start the MetalBond instance
     let mut metalbond = MetalBond::new(config, client, true);
 
     // Start HTTP server if configured
-    if let Some(http_addr) = cli.http {
+    let http_task = if let Some(http_addr) = cli.http {
         // Clone the RouteTable directly and wrap in Arc
         let route_table = Arc::new(metalbond.route_table_view.clone());
-        tokio::spawn(async move {
-            if let Err(e) = metalbond::http_server::run_http_server(http_addr, route_table).await {
-                tracing::error!("HTTP server failed: {}", e);
+        match metalbond::http_server::run_http_server(http_addr, route_table) {
+            Ok(server) => {
+                tracing::info!("HTTP server started");
+                Some(tokio::spawn(server))
+            },
+            Err(e) => {
+                tracing::error!("Failed to start HTTP server: {}", e);
+                None
             }
-        });
-    }
+        }
+    } else {
+        None
+    };
 
     // Start core tasks
     metalbond.start();
@@ -81,7 +76,18 @@ async fn main() -> Result<()> {
     // Wait for shutdown signal
     tokio::signal::ctrl_c().await?;
     tracing::info!("Shutdown signal received.");
+    
+    // Shutdown the MetalBond instance
     metalbond.shutdown().await;
+    
+    // Gracefully shut down the HTTP server if it was started
+    if let Some(task) = http_task {
+        tracing::info!("Stopping HTTP server...");
+        if let Err(e) = task.await {
+            tracing::error!("Error during HTTP server shutdown: {}", e);
+        }
+        tracing::info!("HTTP server stopped");
+    }
 
     Ok(())
 }

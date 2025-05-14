@@ -1,0 +1,172 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MetalBond Route Dashboard</title>
+    <style>
+        body {
+            font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+            margin: 0;
+            padding: 20px;
+            color: #333;
+            line-height: 1.6;
+        }
+        header {
+            margin-bottom: 20px;
+            border-bottom: 1px solid #eee;
+            padding-bottom: 10px;
+        }
+        h1 {
+            font-size: 24px;
+            font-weight: 500;
+            margin: 0 0 5px 0;
+        }
+        .info {
+            color: #666;
+            font-size: 14px;
+            margin-bottom: 10px;
+        }
+        .vni-container {
+            margin-bottom: 30px;
+        }
+        .vni-heading {
+            background-color: #f5f5f5;
+            padding: 10px;
+            border-radius: 4px;
+            margin-bottom: 10px;
+            font-weight: 500;
+        }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-bottom: 20px;
+        }
+        th, td {
+            text-align: left;
+            padding: 10px;
+            border-bottom: 1px solid #eee;
+        }
+        th {
+            font-weight: 500;
+            color: #555;
+        }
+        tr:hover {
+            background-color: #f9f9f9;
+        }
+        .links {
+            margin-top: 20px;
+            padding-top: 10px;
+            border-top: 1px solid #eee;
+        }
+        .links a {
+            margin-right: 15px;
+            color: #0077cc;
+            text-decoration: none;
+        }
+        .links a:hover {
+            text-decoration: underline;
+        }
+        .empty-message {
+            padding: 20px;
+            color: #666;
+            font-style: italic;
+            text-align: center;
+            background-color: #f9f9f9;
+            border-radius: 4px;
+        }
+    </style>
+</head>
+<body>
+    <header>
+        <h1>MetalBond Route Dashboard</h1>
+        <div class="info">Version: {{version}}</div>
+        <div class="info">Last updated: {{date}}</div>
+    </header>
+
+    <div id="content">
+        <!-- Route data will be inserted here via JavaScript -->
+    </div>
+
+    <div class="links">
+        <a href="/routes.json">Download as JSON</a>
+        <a href="/routes.yaml">Download as YAML</a>
+    </div>
+
+    <script>
+        // Fetch route data and populate the UI
+        async function loadRouteData() {
+            try {
+                const response = await fetch('/routes.json');
+                const data = await response.json();
+                displayRouteData(data);
+            } catch (error) {
+                console.error('Error loading route data:', error);
+                document.getElementById('content').innerHTML = `
+                    <div class="empty-message">
+                        Error loading route data: ${error.message}
+                    </div>
+                `;
+            }
+        }
+
+        function displayRouteData(data) {
+            const contentElement = document.getElementById('content');
+            
+            if (!data.vnet || Object.keys(data.vnet).length === 0) {
+                contentElement.innerHTML = `
+                    <div class="empty-message">
+                        No routes are currently available.
+                    </div>
+                `;
+                return;
+            }
+
+            let html = '';
+            
+            for (const [vni, destinations] of Object.entries(data.vnet)) {
+                html += `
+                    <div class="vni-container">
+                        <div class="vni-heading">VNI: ${vni}</div>
+                        <table>
+                            <thead>
+                                <tr>
+                                    <th>Destination</th>
+                                    <th>Next Hops</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                `;
+                
+                for (const [dest, nextHops] of Object.entries(destinations)) {
+                    html += `
+                        <tr>
+                            <td>${dest}</td>
+                            <td>
+                    `;
+                    
+                    for (const hop of nextHops) {
+                        html += `<div>${JSON.stringify(hop)}</div>`;
+                    }
+                    
+                    html += `
+                            </td>
+                        </tr>
+                    `;
+                }
+                
+                html += `
+                            </tbody>
+                        </table>
+                    </div>
+                `;
+            }
+            
+            contentElement.innerHTML = html;
+        }
+
+        // Initial load
+        document.addEventListener('DOMContentLoaded', loadRouteData);
+    </script>
+</body>
+</html>
